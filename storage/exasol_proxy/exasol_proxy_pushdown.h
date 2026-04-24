@@ -21,7 +21,10 @@ public:
 private:
   TABLE *query_table;
   StringBuffer<512> query;
+  StringBuffer<512> stage_query;
+  StringBuffer<256> staged_order_by;
   ExasolMariaDBPushedQueryCursor *cursor;
+  bool uses_staged_distinct_pushdown;
 
   static constexpr auto PRINT_QUERY_TYPE=
       enum_query_type(QT_VIEW_INTERNAL | QT_SELECT_ONLY |

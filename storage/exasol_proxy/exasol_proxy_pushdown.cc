@@ -1,6 +1,7 @@
 /* !!! For inclusion into ha_exasol_proxy.cc */
 
 #include "exasol_proxy_pushdown.h"
+#include <cstring>
 #include <string>
 
 namespace
@@ -21,6 +22,44 @@ void rewrite_query_for_exasol(String *query)
   query->append(rewritten.c_str(), rewritten.size());
 }
 
+void append_exasol_order_clause(String *query,
+                                ORDER *order,
+                                enum_query_type query_type)
+{
+  for (; order; order= order->next)
+  {
+    if (order->counter_used)
+    {
+      char buffer[20];
+      size_t length= my_snprintf(buffer, sizeof(buffer), "%d", order->counter);
+      query->append(buffer, static_cast<uint>(length));
+    }
+    else
+    {
+      if (order->item[0]->is_order_clause_position())
+        query->append(STRING_WITH_LEN("''"));
+      else
+        (*order->item)->print(query, query_type);
+    }
+
+    if (order->direction == ORDER::ORDER_DESC)
+      query->append(STRING_WITH_LEN(" DESC NULLS LAST"));
+    else
+      query->append(STRING_WITH_LEN(" NULLS FIRST"));
+
+    if (order->next)
+      query->append(STRING_WITH_LEN(", "));
+  }
+}
+
+bool should_use_staged_distinct_pushdown(SELECT_LEX *sel_lex)
+{
+  return sel_lex &&
+         (sel_lex->options & SELECT_DISTINCT) &&
+         sel_lex->order_list.elements &&
+         !sel_lex->limit_params.select_limit;
+}
+
 } // namespace
 
 ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
@@ -28,9 +67,14 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   : select_handler(thd_arg, exasol_proxy_hton, lex_unit),
     query_table(tbl),
     query(thd_arg->charset()),
-    cursor(nullptr)
+    stage_query(thd_arg->charset()),
+    staged_order_by(thd_arg->charset()),
+    cursor(nullptr),
+    uses_staged_distinct_pushdown(false)
 {
   query.length(0);
+  stage_query.length(0);
+  staged_order_by.length(0);
   lex_unit->print(&query, PRINT_QUERY_TYPE);
   rewrite_query_for_exasol(&query);
 }
@@ -40,9 +84,25 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   : select_handler(thd_arg, exasol_proxy_hton, sel_lex, lex_unit),
     query_table(tbl),
     query(thd_arg->charset()),
+    stage_query(thd_arg->charset()),
+    staged_order_by(thd_arg->charset()),
     cursor(nullptr)
 {
   query.length(0);
+  stage_query.length(0);
+  staged_order_by.length(0);
+
+  uses_staged_distinct_pushdown= should_use_staged_distinct_pushdown(sel_lex);
+  if (uses_staged_distinct_pushdown)
+  {
+    sel_lex->master_unit()->print(&stage_query, PRINT_QUERY_TYPE);
+    rewrite_query_for_exasol(&stage_query);
+    append_exasol_order_clause(&staged_order_by,
+                               sel_lex->order_list.first,
+                               PRINT_QUERY_TYPE);
+    return;
+  }
+
   if (get_pushdown_type() == select_pushdown_type::SINGLE_SELECT)
     sel_lex->master_unit()->print(&query, PRINT_QUERY_TYPE);
   else
@@ -66,9 +126,40 @@ int ha_exasol_proxy_select_handler::init_scan()
     return HA_ERR_INTERNAL_ERROR;
 
   char error_buffer[512]= {0};
+  if (uses_staged_distinct_pushdown)
+  {
+    if (!exasol_proxy_core_abi->stagePushedQueryResult)
+      return HA_ERR_INTERNAL_ERROR;
+
+    char qualified_name[512]= {0};
+    const int stage_rc= exasol_proxy_core_abi->stagePushedQueryResult(
+        thd,
+        stage_query.ptr(),
+        qualified_name,
+        sizeof(qualified_name),
+        error_buffer,
+        sizeof(error_buffer));
+    if (stage_rc != 0)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), stage_rc,
+               error_buffer[0] ? error_buffer : "failed to stage EXASOL pushed query");
+      return stage_rc;
+    }
+
+    query.length(0);
+    query.append(STRING_WITH_LEN("SELECT * FROM "));
+    query.append(qualified_name, static_cast<uint>(std::strlen(qualified_name)));
+    if (staged_order_by.length() > 0)
+    {
+      query.append(STRING_WITH_LEN(" ORDER BY "));
+      query.append(staged_order_by.ptr(), staged_order_by.length());
+    }
+  }
+
   cursor= exasol_proxy_core_abi->openPushedQuery(thd,
                                                  table,
                                                  query.ptr(),
+                                                 uses_staged_distinct_pushdown ? 1 : 0,
                                                  error_buffer,
                                                  sizeof(error_buffer));
   if (!cursor)

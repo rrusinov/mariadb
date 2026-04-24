@@ -24,7 +24,6 @@ static select_handler *create_exasol_proxy_unit_handler(THD *thd,
                                                         SELECT_LEX_UNIT *lex_unit);
 
 static handlerton *exasol_proxy_hton= nullptr;
-static void *exasol_proxy_core_handle= nullptr;
 static const ExasolMariaDBCoreAbiV1 *exasol_proxy_core_abi= nullptr;
 
 static void exasol_proxy_log_error(const char *message)
@@ -46,27 +45,14 @@ static int exasol_proxy_load_core()
   if (exasol_proxy_core_abi)
     return 0;
 
-  const char *core_soname= std::getenv("EXASOL_PROXY_CORE_SONAME");
-  if (!core_soname || !*core_soname)
-    core_soname= "ha_exasol.so";
-
-  exasol_proxy_core_handle= dlopen(core_soname, RTLD_NOW | RTLD_LOCAL);
-  if (!exasol_proxy_core_handle)
-  {
-    exasol_proxy_log_dlerror("failed to load EXASOL core module");
-    return 1;
-  }
-
   dlerror();
   typedef const ExasolMariaDBCoreAbiV1 *(*get_core_abi_v1_fn)();
   get_core_abi_v1_fn get_core_abi_v1=
-    reinterpret_cast<get_core_abi_v1_fn>(dlsym(exasol_proxy_core_handle,
+    reinterpret_cast<get_core_abi_v1_fn>(dlsym(RTLD_DEFAULT,
                                                "exasol_mariadb_get_core_abi_v1"));
   if (!get_core_abi_v1)
   {
-    exasol_proxy_log_dlerror("failed to resolve EXASOL core ABI");
-    dlclose(exasol_proxy_core_handle);
-    exasol_proxy_core_handle= nullptr;
+    exasol_proxy_log_dlerror("failed to resolve preloaded EXASOL core ABI");
     return 1;
   }
 
@@ -76,8 +62,6 @@ static int exasol_proxy_load_core()
   {
     exasol_proxy_log_error("unsupported EXASOL core ABI");
     exasol_proxy_core_abi= nullptr;
-    dlclose(exasol_proxy_core_handle);
-    exasol_proxy_core_handle= nullptr;
     return 1;
   }
 
@@ -131,11 +115,25 @@ static bool is_supported_exasol_proxy_pushdown(enum_sql_command sql_command)
   }
 }
 
+static bool is_supported_exasol_proxy_select(SELECT_LEX *sel_lex)
+{
+  if (!sel_lex)
+    return false;
+
+  if (!(sel_lex->options & SELECT_DISTINCT))
+    return true;
+
+  return !sel_lex->limit_params.select_limit;
+}
+
 static select_handler *create_exasol_proxy_select_handler(THD *thd,
                                                           SELECT_LEX *sel_lex,
                                                           SELECT_LEX_UNIT *lex_unit)
 {
   if (!is_supported_exasol_proxy_pushdown(thd->lex->sql_command))
+    return nullptr;
+
+  if (!is_supported_exasol_proxy_select(sel_lex))
     return nullptr;
 
   TABLE *tbl= get_exasol_proxy_table_for_pushdown(sel_lex);
@@ -153,6 +151,13 @@ static select_handler *create_exasol_proxy_unit_handler(THD *thd,
 {
   if (!is_supported_exasol_proxy_pushdown(thd->lex->sql_command))
     return nullptr;
+
+  for (SELECT_LEX *sel_lex= lex_unit->first_select(); sel_lex;
+       sel_lex= sel_lex->next_select())
+  {
+    if (!is_supported_exasol_proxy_select(sel_lex))
+      return nullptr;
+  }
 
   TABLE *tbl= get_exasol_proxy_table_for_unit_pushdown(lex_unit);
   if (!tbl)
@@ -188,11 +193,6 @@ static int exasol_proxy_done(void *)
     exasol_proxy_core_abi->deinitStorageEngine(nullptr);
   exasol_proxy_hton= nullptr;
   exasol_proxy_core_abi= nullptr;
-  if (exasol_proxy_core_handle)
-  {
-    dlclose(exasol_proxy_core_handle);
-    exasol_proxy_core_handle= nullptr;
-  }
   return 0;
 }
 
