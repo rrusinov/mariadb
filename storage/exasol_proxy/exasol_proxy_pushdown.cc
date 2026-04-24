@@ -62,14 +62,89 @@ bool should_use_staged_distinct_pushdown(SELECT_LEX *sel_lex)
 
 } // namespace
 
+int ha_exasol_proxy_pushdown_handler_base::init_scan_(THD *thd_arg,
+                                                      TABLE *table_arg,
+                                                      const char *query_text,
+                                                      bool clear_temporary_tables_on_close)
+{
+  if (!exasol_proxy_core_abi || !exasol_proxy_core_abi->openPushedQuery)
+    return HA_ERR_INTERNAL_ERROR;
+
+  char error_buffer[512]= {0};
+  cursor= exasol_proxy_core_abi->openPushedQuery(thd_arg,
+                                                 table_arg,
+                                                 query_text,
+                                                 clear_temporary_tables_on_close ? 1 : 0,
+                                                 error_buffer,
+                                                 sizeof(error_buffer));
+  if (!cursor)
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+             error_buffer[0] ? error_buffer : "failed to open EXASOL pushed query");
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  return 0;
+}
+
+int ha_exasol_proxy_pushdown_handler_base::next_row_(TABLE *table_arg)
+{
+  if (!cursor || !exasol_proxy_core_abi || !exasol_proxy_core_abi->fetchPushedQueryRow)
+    return HA_ERR_END_OF_FILE;
+
+  char error_buffer[512]= {0};
+  const int rc= exasol_proxy_core_abi->fetchPushedQueryRow(cursor,
+                                                           table_arg,
+                                                           table_arg->record[0],
+                                                           error_buffer,
+                                                           sizeof(error_buffer));
+  if (rc != 0 && rc != HA_ERR_END_OF_FILE)
+  {
+    my_error(ER_GET_ERRNO, MYF(0), rc,
+             error_buffer[0] ? error_buffer : "failed to fetch EXASOL pushed query row");
+  }
+  return rc;
+}
+
+int ha_exasol_proxy_pushdown_handler_base::end_scan_()
+{
+  if (cursor && exasol_proxy_core_abi && exasol_proxy_core_abi->closePushedQuery)
+  {
+    char error_buffer[512]= {0};
+    const int rc=
+        exasol_proxy_core_abi->closePushedQuery(cursor, error_buffer, sizeof(error_buffer));
+    cursor= nullptr;
+    if (rc != 0)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), rc,
+               error_buffer[0] ? error_buffer : "failed to close EXASOL pushed query");
+      return rc;
+    }
+  }
+  return 0;
+}
+
+ha_exasol_proxy_derived_handler::ha_exasol_proxy_derived_handler(THD *thd_arg,
+                                                                 TABLE_LIST *derived_arg,
+                                                                 TABLE *tbl_arg)
+  : derived_handler(thd_arg, exasol_proxy_hton),
+    ha_exasol_proxy_pushdown_handler_base(tbl_arg),
+    query(thd_arg->charset())
+{
+  derived= derived_arg;
+  query.length(0);
+  derived_arg->derived->print(&query, PRINT_QUERY_TYPE);
+  rewrite_query_for_exasol(&query);
+}
+
+ha_exasol_proxy_derived_handler::~ha_exasol_proxy_derived_handler()= default;
+
 ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
     THD *thd_arg, SELECT_LEX_UNIT *lex_unit, TABLE *tbl)
   : select_handler(thd_arg, exasol_proxy_hton, lex_unit),
-    query_table(tbl),
+    ha_exasol_proxy_pushdown_handler_base(tbl),
     query(thd_arg->charset()),
     stage_query(thd_arg->charset()),
     staged_order_by(thd_arg->charset()),
-    cursor(nullptr),
     uses_staged_distinct_pushdown(false)
 {
   query.length(0);
@@ -82,11 +157,11 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
 ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
     THD *thd_arg, SELECT_LEX *sel_lex, SELECT_LEX_UNIT *lex_unit, TABLE *tbl)
   : select_handler(thd_arg, exasol_proxy_hton, sel_lex, lex_unit),
-    query_table(tbl),
+    ha_exasol_proxy_pushdown_handler_base(tbl),
     query(thd_arg->charset()),
     stage_query(thd_arg->charset()),
     staged_order_by(thd_arg->charset()),
-    cursor(nullptr)
+    uses_staged_distinct_pushdown(false)
 {
   query.length(0);
   stage_query.length(0);
@@ -112,22 +187,14 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
 
 ha_exasol_proxy_select_handler::~ha_exasol_proxy_select_handler()
 {
-  if (cursor && exasol_proxy_core_abi && exasol_proxy_core_abi->closePushedQuery)
-  {
-    char error_buffer[512]= {0};
-    exasol_proxy_core_abi->closePushedQuery(cursor, error_buffer, sizeof(error_buffer));
-    cursor= nullptr;
-  }
+  (void) end_scan_();
 }
 
 int ha_exasol_proxy_select_handler::init_scan()
 {
-  if (!exasol_proxy_core_abi || !exasol_proxy_core_abi->openPushedQuery)
-    return HA_ERR_INTERNAL_ERROR;
-
-  char error_buffer[512]= {0};
   if (uses_staged_distinct_pushdown)
   {
+    char error_buffer[512]= {0};
     if (!exasol_proxy_core_abi->stagePushedQueryResult)
       return HA_ERR_INTERNAL_ERROR;
 
@@ -156,54 +223,15 @@ int ha_exasol_proxy_select_handler::init_scan()
     }
   }
 
-  cursor= exasol_proxy_core_abi->openPushedQuery(thd,
-                                                 table,
-                                                 query.ptr(),
-                                                 uses_staged_distinct_pushdown ? 1 : 0,
-                                                 error_buffer,
-                                                 sizeof(error_buffer));
-  if (!cursor)
-  {
-    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
-             error_buffer[0] ? error_buffer : "failed to open EXASOL pushed query");
-    return HA_ERR_INTERNAL_ERROR;
-  }
-  return 0;
+  return init_scan_(thd, table, query.ptr(), uses_staged_distinct_pushdown);
 }
 
 int ha_exasol_proxy_select_handler::next_row()
 {
-  if (!cursor || !exasol_proxy_core_abi || !exasol_proxy_core_abi->fetchPushedQueryRow)
-    return HA_ERR_END_OF_FILE;
-
-  char error_buffer[512]= {0};
-  const int rc= exasol_proxy_core_abi->fetchPushedQueryRow(cursor,
-                                                           table,
-                                                           table->record[0],
-                                                           error_buffer,
-                                                           sizeof(error_buffer));
-  if (rc != 0 && rc != HA_ERR_END_OF_FILE)
-  {
-    my_error(ER_GET_ERRNO, MYF(0), rc,
-             error_buffer[0] ? error_buffer : "failed to fetch EXASOL pushed query row");
-  }
-  return rc;
+  return next_row_(table);
 }
 
 int ha_exasol_proxy_select_handler::end_scan()
 {
-  if (cursor && exasol_proxy_core_abi && exasol_proxy_core_abi->closePushedQuery)
-  {
-    char error_buffer[512]= {0};
-    const int rc=
-        exasol_proxy_core_abi->closePushedQuery(cursor, error_buffer, sizeof(error_buffer));
-    cursor= nullptr;
-    if (rc != 0)
-    {
-      my_error(ER_GET_ERRNO, MYF(0), rc,
-               error_buffer[0] ? error_buffer : "failed to close EXASOL pushed query");
-      return rc;
-    }
-  }
-  return 0;
+  return end_scan_();
 }

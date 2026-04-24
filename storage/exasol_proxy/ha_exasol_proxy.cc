@@ -22,6 +22,8 @@ static select_handler *create_exasol_proxy_select_handler(THD *thd,
                                                           SELECT_LEX_UNIT *lex_unit);
 static select_handler *create_exasol_proxy_unit_handler(THD *thd,
                                                         SELECT_LEX_UNIT *lex_unit);
+static derived_handler *create_exasol_proxy_derived_handler(THD *thd,
+                                                            TABLE_LIST *derived);
 
 static handlerton *exasol_proxy_hton= nullptr;
 static const ExasolMariaDBCoreAbiV1 *exasol_proxy_core_abi= nullptr;
@@ -78,12 +80,26 @@ static TABLE *get_exasol_proxy_table_for_pushdown(SELECT_LEX *sel_lex)
 {
   TABLE_LIST *tbl= sel_lex->join ? sel_lex->join->tables_list : nullptr;
   TABLE *found= nullptr;
-  for (; tbl; tbl= tbl->next_global)
+  for (; tbl; tbl= tbl->next_local)
   {
+    if (tbl->derived)
+      continue;
     if (!exasol_proxy_table_belongs_to_engine(tbl))
       return nullptr;
     if (!found)
       found= tbl->table;
+  }
+
+  for (SELECT_LEX_UNIT *unit= sel_lex->first_inner_unit(); unit; unit= unit->next_unit())
+  {
+    for (SELECT_LEX *inner= unit->first_select(); inner; inner= inner->next_select())
+    {
+      TABLE *next_table= get_exasol_proxy_table_for_pushdown(inner);
+      if (!next_table)
+        return nullptr;
+      if (!found)
+        found= next_table;
+    }
   }
   return found;
 }
@@ -169,6 +185,22 @@ static select_handler *create_exasol_proxy_unit_handler(THD *thd,
   return new ha_exasol_proxy_select_handler(thd, lex_unit, tbl);
 }
 
+static derived_handler *create_exasol_proxy_derived_handler(THD *thd,
+                                                            TABLE_LIST *derived)
+{
+  if (!derived || !derived->derived)
+    return nullptr;
+
+  if (!is_supported_exasol_proxy_pushdown(thd->lex->sql_command))
+    return nullptr;
+
+  TABLE *tbl= get_exasol_proxy_table_for_unit_pushdown(derived->derived);
+  if (!tbl)
+    return nullptr;
+
+  return new ha_exasol_proxy_derived_handler(thd, derived, tbl);
+}
+
 static int exasol_proxy_init(void *p)
 {
   if (exasol_proxy_load_core() != 0)
@@ -184,6 +216,7 @@ static int exasol_proxy_init(void *p)
   }
   exasol_proxy_hton->create_select= create_exasol_proxy_select_handler;
   exasol_proxy_hton->create_unit= create_exasol_proxy_unit_handler;
+  exasol_proxy_hton->create_derived= create_exasol_proxy_derived_handler;
   return 0;
 }
 
