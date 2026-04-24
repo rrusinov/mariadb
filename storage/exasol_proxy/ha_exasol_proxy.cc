@@ -119,6 +119,8 @@ static TABLE *get_exasol_proxy_table_for_unit_pushdown(SELECT_LEX_UNIT *lex_unit
   return table;
 }
 
+static bool are_supported_exasol_proxy_selects(SELECT_LEX_UNIT *lex_unit);
+
 static bool is_supported_exasol_proxy_pushdown(enum_sql_command sql_command)
 {
   switch (sql_command)
@@ -136,10 +138,34 @@ static bool is_supported_exasol_proxy_select(SELECT_LEX *sel_lex)
   if (!sel_lex)
     return false;
 
-  if (!(sel_lex->options & SELECT_DISTINCT))
-    return true;
+  if (sel_lex->limit_params.with_ties)
+    return false;
 
-  return !sel_lex->limit_params.select_limit;
+  if ((sel_lex->options & SELECT_DISTINCT) && sel_lex->order_list.elements &&
+      sel_lex->limit_params.select_limit)
+    return false;
+
+  for (SELECT_LEX_UNIT *unit= sel_lex->first_inner_unit(); unit; unit= unit->next_unit())
+  {
+    if (!are_supported_exasol_proxy_selects(unit))
+      return false;
+  }
+
+  return true;
+}
+
+static bool are_supported_exasol_proxy_selects(SELECT_LEX_UNIT *lex_unit)
+{
+  if (!lex_unit)
+    return false;
+
+  for (SELECT_LEX *sel_lex= lex_unit->first_select(); sel_lex;
+       sel_lex= sel_lex->next_select())
+  {
+    if (!is_supported_exasol_proxy_select(sel_lex))
+      return false;
+  }
+  return true;
 }
 
 static select_handler *create_exasol_proxy_select_handler(THD *thd,
@@ -168,12 +194,8 @@ static select_handler *create_exasol_proxy_unit_handler(THD *thd,
   if (!is_supported_exasol_proxy_pushdown(thd->lex->sql_command))
     return nullptr;
 
-  for (SELECT_LEX *sel_lex= lex_unit->first_select(); sel_lex;
-       sel_lex= sel_lex->next_select())
-  {
-    if (!is_supported_exasol_proxy_select(sel_lex))
-      return nullptr;
-  }
+  if (!are_supported_exasol_proxy_selects(lex_unit))
+    return nullptr;
 
   TABLE *tbl= get_exasol_proxy_table_for_unit_pushdown(lex_unit);
   if (!tbl)
@@ -194,8 +216,14 @@ static derived_handler *create_exasol_proxy_derived_handler(THD *thd,
   if (!is_supported_exasol_proxy_pushdown(thd->lex->sql_command))
     return nullptr;
 
+  if (!are_supported_exasol_proxy_selects(derived->derived))
+    return nullptr;
+
   TABLE *tbl= get_exasol_proxy_table_for_unit_pushdown(derived->derived);
   if (!tbl)
+    return nullptr;
+
+  if (derived->derived->uncacheable & UNCACHEABLE_SIDEEFFECT)
     return nullptr;
 
   return new ha_exasol_proxy_derived_handler(thd, derived, tbl);

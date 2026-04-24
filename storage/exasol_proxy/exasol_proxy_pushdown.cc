@@ -37,7 +37,12 @@ void append_exasol_order_clause(String *query,
     else
     {
       if (order->item[0]->is_order_clause_position())
-        query->append(STRING_WITH_LEN("''"));
+      {
+        char buffer[20];
+        const longlong position= (*order->item)->val_int();
+        size_t length= my_snprintf(buffer, sizeof(buffer), "%lld", position);
+        query->append(buffer, static_cast<uint>(length));
+      }
       else
         (*order->item)->print(query, query_type);
     }
