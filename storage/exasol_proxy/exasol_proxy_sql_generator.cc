@@ -7,6 +7,7 @@
 #include <my_global.h>
 
 #include "item.h"
+#include "item_cmpfunc.h"
 #include "item_func.h"
 #include "item_sum.h"
 #include "m_string.h"
@@ -503,6 +504,8 @@ private:
         return SqlGenerationResult::generated("NULL");
       case Item::FUNC_ITEM:
         return emit_function(static_cast<Item_func *>(item));
+      case Item::COND_ITEM:
+        return emit_condition(static_cast<Item_cond *>(item));
       case Item::SUM_FUNC_ITEM:
         return emit_aggregate(static_cast<Item_sum *>(item));
       default:
@@ -512,6 +515,8 @@ private:
 
   SqlGenerationResult emit_ref(Item_ref *item)
   {
+    if (!is_empty(item->table_name))
+      return emit_identifier(item);
     if (item->ref && *item->ref)
       return emit_expression(*item->ref);
     return emit_identifier(item);
@@ -520,7 +525,9 @@ private:
   SqlGenerationResult emit_identifier(Item_ident *item)
   {
     std::string sql;
-    if (!is_empty(item->db_name))
+    const bool alias_reference=
+        item->alias_name_used || (item->cached_table && item->cached_table->is_alias);
+    if (!alias_reference && !is_empty(item->db_name))
     {
       sql+= quote_identifier(item->db_name);
       sql+= ".";
@@ -610,6 +617,47 @@ private:
       default:
         return emit_named_or_operator_function(function);
     }
+  }
+
+  SqlGenerationResult emit_condition(Item_cond *condition)
+  {
+    const char *operator_text= nullptr;
+    switch (condition->functype())
+    {
+      case Item_func::COND_AND_FUNC:
+        operator_text= "AND";
+        break;
+      case Item_func::COND_OR_FUNC:
+        operator_text= "OR";
+        break;
+      default:
+        return unsupported("unsupported condition function");
+    }
+
+    List<Item> *arguments= condition->argument_list();
+    if (!arguments || arguments->is_empty())
+      return unsupported("condition function has no arguments");
+
+    std::string sql= "(";
+    bool first= true;
+    List_iterator_fast<Item> iterator(*arguments);
+    Item *argument;
+    while ((argument= iterator++))
+    {
+      auto expression= emit_expression(argument);
+      if (!expression.supported())
+        return expression;
+      if (!first)
+      {
+        sql+= " ";
+        sql+= operator_text;
+        sql+= " ";
+      }
+      sql+= expression.sql;
+      first= false;
+    }
+    sql+= ")";
+    return SqlGenerationResult::generated(std::move(sql));
   }
 
   SqlGenerationResult emit_named_or_operator_function(Item_func *function)

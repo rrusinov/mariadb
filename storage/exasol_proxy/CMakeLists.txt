@@ -1,4 +1,8 @@
-INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/../db/Server/include)
+IF(EXISTS "${CMAKE_SOURCE_DIR}/../db/Server/include")
+  INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/../db/Server/include)
+ELSEIF(EXISTS "${CMAKE_SOURCE_DIR}/../Server/include")
+  INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/../Server/include)
+ENDIF()
 
 SET(EXASOL_PROXY_SOURCES
   exasol_proxy_sql_generator.cc
