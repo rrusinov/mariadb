@@ -1,60 +1,24 @@
 /* !!! For inclusion into ha_exasol_proxy.cc */
 
 #include "exasol_proxy_pushdown.h"
+#include "exasol_proxy_sql_generator.h"
 #include <cstring>
-#include <string>
 
 namespace
 {
 
-void rewrite_query_for_exasol(String *query)
+void set_query_from_generated_sql(String *query,
+                                  std::string *query_generation_error,
+                                  const exasol_proxy::SqlGenerationResult &generated)
 {
-  if (!query)
+  if (!generated.supported())
+  {
+    *query_generation_error= generated.unsupported_reason;
     return;
-
-  std::string rewritten(query->ptr(), query->length());
-  for (char &ch : rewritten)
-  {
-    if (ch == '`')
-      ch= '"';
   }
+  query_generation_error->clear();
   query->length(0);
-  query->append(rewritten.c_str(), rewritten.size());
-}
-
-void append_exasol_order_clause(String *query,
-                                ORDER *order,
-                                enum_query_type query_type)
-{
-  for (; order; order= order->next)
-  {
-    if (order->counter_used)
-    {
-      char buffer[20];
-      size_t length= my_snprintf(buffer, sizeof(buffer), "%d", order->counter);
-      query->append(buffer, static_cast<uint>(length));
-    }
-    else
-    {
-      if (order->item[0]->is_order_clause_position())
-      {
-        char buffer[20];
-        const longlong position= (*order->item)->val_int();
-        size_t length= my_snprintf(buffer, sizeof(buffer), "%lld", position);
-        query->append(buffer, static_cast<uint>(length));
-      }
-      else
-        (*order->item)->print(query, query_type);
-    }
-
-    if (order->direction == ORDER::ORDER_DESC)
-      query->append(STRING_WITH_LEN(" DESC NULLS LAST"));
-    else
-      query->append(STRING_WITH_LEN(" NULLS FIRST"));
-
-    if (order->next)
-      query->append(STRING_WITH_LEN(", "));
-  }
+  query->append(generated.sql.c_str(), generated.sql.size());
 }
 
 bool should_use_staged_distinct_pushdown(SELECT_LEX *sel_lex)
@@ -72,6 +36,13 @@ int ha_exasol_proxy_pushdown_handler_base::init_scan_(THD *thd_arg,
                                                       const char *query_text,
                                                       bool clear_temporary_tables_on_close)
 {
+  if (!query_generation_error.empty())
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+             query_generation_error.c_str());
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
   if (!exasol_proxy_core_abi || !exasol_proxy_core_abi->openPushedQuery)
     return HA_ERR_INTERNAL_ERROR;
 
@@ -137,8 +108,8 @@ ha_exasol_proxy_derived_handler::ha_exasol_proxy_derived_handler(THD *thd_arg,
 {
   derived= derived_arg;
   query.length(0);
-  derived_arg->derived->print(&query, PRINT_QUERY_TYPE);
-  rewrite_query_for_exasol(&query);
+  auto generated= exasol_proxy::generate_exasol_sql(thd_arg, derived_arg->derived);
+  set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
 ha_exasol_proxy_derived_handler::~ha_exasol_proxy_derived_handler()= default;
@@ -155,8 +126,8 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   query.length(0);
   stage_query.length(0);
   staged_order_by.length(0);
-  lex_unit->print(&query, PRINT_QUERY_TYPE);
-  rewrite_query_for_exasol(&query);
+  auto generated= exasol_proxy::generate_exasol_sql(thd_arg, lex_unit);
+  set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
 ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
@@ -175,19 +146,18 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   uses_staged_distinct_pushdown= should_use_staged_distinct_pushdown(sel_lex);
   if (uses_staged_distinct_pushdown)
   {
-    sel_lex->master_unit()->print(&stage_query, PRINT_QUERY_TYPE);
-    rewrite_query_for_exasol(&stage_query);
-    append_exasol_order_clause(&staged_order_by,
-                               sel_lex->order_list.first,
-                               PRINT_QUERY_TYPE);
+    auto generated= exasol_proxy::generate_exasol_sql(thd_arg, sel_lex->master_unit());
+    set_query_from_generated_sql(&stage_query, &query_generation_error, generated);
+
+    auto order_by= exasol_proxy::generate_exasol_order_sql(thd_arg, sel_lex->order_list.first);
+    set_query_from_generated_sql(&staged_order_by, &query_generation_error, order_by);
     return;
   }
 
-  if (get_pushdown_type() == select_pushdown_type::SINGLE_SELECT)
-    sel_lex->master_unit()->print(&query, PRINT_QUERY_TYPE);
-  else
-    sel_lex->print(thd_arg, &query, PRINT_QUERY_TYPE);
-  rewrite_query_for_exasol(&query);
+  auto generated= get_pushdown_type() == select_pushdown_type::SINGLE_SELECT ?
+      exasol_proxy::generate_exasol_sql(thd_arg, sel_lex->master_unit()) :
+      exasol_proxy::generate_exasol_sql(thd_arg, sel_lex);
+  set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
 ha_exasol_proxy_select_handler::~ha_exasol_proxy_select_handler()

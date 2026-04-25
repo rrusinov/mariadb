@@ -1,6 +1,7 @@
 INCLUDE_DIRECTORIES(BEFORE ${CMAKE_SOURCE_DIR}/../db/Server/include)
 
 SET(EXASOL_PROXY_SOURCES
+  exasol_proxy_sql_generator.cc
   ha_exasol_proxy.cc)
 
 MYSQL_ADD_PLUGIN(exasol_proxy ${EXASOL_PROXY_SOURCES} STORAGE_ENGINE MODULE_ONLY

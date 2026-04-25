@@ -5,6 +5,8 @@
 #include "sql_string.h"
 #include "select_handler.h"
 
+#include <string>
+
 class ha_exasol_proxy;
 
 class ha_exasol_proxy_pushdown_handler_base
@@ -24,6 +26,7 @@ protected:
 
   TABLE *query_table;
   ExasolMariaDBPushedQueryCursor *cursor;
+  std::string query_generation_error;
 };
 
 class ha_exasol_proxy_derived_handler: public derived_handler,
@@ -39,10 +42,6 @@ public:
 
 private:
   StringBuffer<512> query;
-
-  static constexpr auto PRINT_QUERY_TYPE=
-      enum_query_type(QT_VIEW_INTERNAL | QT_SELECT_ONLY |
-                      QT_ITEM_ORIGINAL_FUNC_NULLIF | QT_PARSABLE);
 };
 
 class ha_exasol_proxy_select_handler: public select_handler,
@@ -63,10 +62,6 @@ private:
   StringBuffer<512> stage_query;
   StringBuffer<256> staged_order_by;
   bool uses_staged_distinct_pushdown;
-
-  static constexpr auto PRINT_QUERY_TYPE=
-      enum_query_type(QT_VIEW_INTERNAL | QT_SELECT_ONLY |
-                      QT_ITEM_ORIGINAL_FUNC_NULLIF | QT_PARSABLE);
 };
 
 #endif
