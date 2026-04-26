@@ -10,10 +10,14 @@
 #include "item_cmpfunc.h"
 #include "item_func.h"
 #include "item_sum.h"
+#include "item_subselect.h"
+#include "item_timefunc.h"
+#include "item_windowfunc.h"
 #include "m_string.h"
 #include "my_decimal.h"
 #include "sql_class.h"
 #include "sql_lex.h"
+#include "sql_window.h"
 #include "table.h"
 
 #include <cctype>
@@ -105,6 +109,41 @@ SqlGenerationResult decimal_to_sql(const my_decimal &value)
   return SqlGenerationResult::generated(std::string(buffer.ptr(), buffer.length()));
 }
 
+SqlGenerationResult temporal_to_sql(const MYSQL_TIME &value, uint decimals)
+{
+  char buffer[MAX_DATE_STRING_REP_LENGTH];
+  std::string sql;
+  switch (value.time_type)
+  {
+    case MYSQL_TIMESTAMP_DATE:
+    {
+      const int length= my_date_to_str(&value, buffer);
+      sql= "DATE '";
+      sql.append(buffer, length);
+      sql+= "'";
+      return SqlGenerationResult::generated(std::move(sql));
+    }
+    case MYSQL_TIMESTAMP_DATETIME:
+    {
+      const int length= my_datetime_to_str(&value, buffer, decimals);
+      sql= "TIMESTAMP '";
+      sql.append(buffer, length);
+      sql+= "'";
+      return SqlGenerationResult::generated(std::move(sql));
+    }
+    case MYSQL_TIMESTAMP_TIME:
+    {
+      const int length= my_time_to_str(&value, buffer, decimals);
+      sql= "TIME '";
+      sql.append(buffer, length);
+      sql+= "'";
+      return SqlGenerationResult::generated(std::move(sql));
+    }
+    default:
+      return SqlGenerationResult::unsupported("unsupported temporal constant");
+  }
+}
+
 class Generator
 {
 public:
@@ -119,6 +158,19 @@ public:
 
   SqlGenerationResult generate(st_select_lex_unit *lex_unit)
   {
+    return generate_unit(lex_unit, false);
+  }
+
+  SqlGenerationResult generate(st_select_lex *sel_lex)
+  {
+    return generate_select(sel_lex, false);
+  }
+
+private:
+  THD *thd;
+
+  SqlGenerationResult generate_unit(st_select_lex_unit *lex_unit, bool suppress_positive_limit)
+  {
     if (!thd)
       return unsupported("missing MariaDB THD");
     if (!lex_unit)
@@ -128,12 +180,12 @@ public:
     if (!first)
       return unsupported("empty SELECT_LEX_UNIT");
     if (first->next_select())
-      return generate_compound_select(lex_unit);
+      return generate_compound_select(lex_unit, suppress_positive_limit);
 
-    return generate(first);
+    return generate_select(first, suppress_positive_limit);
   }
 
-  SqlGenerationResult generate(st_select_lex *sel_lex)
+  SqlGenerationResult generate_select(st_select_lex *sel_lex, bool suppress_positive_limit)
   {
     if (!thd)
       return unsupported("missing MariaDB THD");
@@ -172,9 +224,17 @@ public:
       auto group_by= emit_order_list(sel_lex->group_list.first, false);
       if (!group_by.supported())
         return group_by;
+      auto olap_prefix= emit_olap_group_prefix(sel_lex);
+      if (!olap_prefix.supported())
+        return olap_prefix;
       sql+= " GROUP BY ";
+      sql+= olap_prefix.sql;
       sql+= group_by.sql;
+      if (!olap_prefix.sql.empty())
+        sql+= ")";
     }
+    else if (sel_lex->olap != UNSPECIFIED_OLAP_TYPE)
+      return unsupported("OLAP grouping without GROUP BY is not supported");
 
     if (sel_lex->having)
     {
@@ -197,7 +257,9 @@ public:
     if (sel_lex->limit_params.with_ties)
       return unsupported("LIMIT WITH TIES emission is not supported");
 
-    if (sel_lex->limit_params.explicit_limit && sel_lex->limit_params.select_limit)
+    const bool suppress_limit= should_suppress_positive_limit(sel_lex, suppress_positive_limit);
+    if (!suppress_limit && sel_lex->limit_params.explicit_limit &&
+        sel_lex->limit_params.select_limit)
     {
       auto limit= emit_integer_constant(sel_lex->limit_params.select_limit);
       if (!limit.supported())
@@ -206,7 +268,8 @@ public:
       sql+= limit.sql;
     }
 
-    if (sel_lex->limit_params.explicit_limit && sel_lex->limit_params.offset_limit)
+    if (!suppress_limit && sel_lex->limit_params.explicit_limit &&
+        sel_lex->limit_params.offset_limit)
     {
       auto offset= emit_integer_constant(sel_lex->limit_params.offset_limit);
       if (!offset.supported())
@@ -218,16 +281,14 @@ public:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
-private:
-  THD *thd;
-
-  SqlGenerationResult generate_compound_select(st_select_lex_unit *lex_unit)
+  SqlGenerationResult generate_compound_select(st_select_lex_unit *lex_unit,
+                                               bool suppress_positive_limit)
   {
     std::string sql;
     bool first_select= true;
     for (st_select_lex *select= lex_unit->first_select(); select; select= select->next_select())
     {
-      auto select_sql= generate(select);
+      auto select_sql= generate_select(select, false);
       if (!select_sql.supported())
         return select_sql;
 
@@ -247,7 +308,7 @@ private:
       first_select= false;
     }
 
-    auto global_order_limit= emit_global_order_limit(lex_unit);
+    auto global_order_limit= emit_global_order_limit(lex_unit, suppress_positive_limit);
     if (!global_order_limit.supported())
       return global_order_limit;
     sql+= global_order_limit.sql;
@@ -361,9 +422,9 @@ private:
   {
     std::string sql;
 
-    if (table->derived && table->is_anonymous_derived_table())
+    if (table->derived)
     {
-      auto derived= generate(table->derived);
+      auto derived= generate_unit(table->derived, false);
       if (!derived.supported())
         return derived;
       sql+= "(";
@@ -375,9 +436,6 @@ private:
       sql+= quote_identifier(table->alias);
       return SqlGenerationResult::generated(std::move(sql));
     }
-
-    if (table->derived)
-      return unsupported("view-backed derived table emission is not implemented yet");
 
     if (!is_empty(table->db))
     {
@@ -414,7 +472,8 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
-  SqlGenerationResult emit_global_order_limit(st_select_lex_unit *lex_unit)
+  SqlGenerationResult emit_global_order_limit(st_select_lex_unit *lex_unit,
+                                              bool suppress_positive_limit)
   {
     st_select_lex *parameters= lex_unit->global_parameters();
     if (!parameters)
@@ -433,7 +492,9 @@ private:
     if (parameters->limit_params.with_ties)
       return unsupported("compound SELECT LIMIT WITH TIES emission is not supported");
 
-    if (parameters->limit_params.explicit_limit && parameters->limit_params.select_limit)
+    const bool suppress_limit= should_suppress_positive_limit(parameters, suppress_positive_limit);
+    if (!suppress_limit && parameters->limit_params.explicit_limit &&
+        parameters->limit_params.select_limit)
     {
       auto limit= emit_integer_constant(parameters->limit_params.select_limit);
       if (!limit.supported())
@@ -442,7 +503,8 @@ private:
       sql+= limit.sql;
     }
 
-    if (parameters->limit_params.explicit_limit && parameters->limit_params.offset_limit)
+    if (!suppress_limit && parameters->limit_params.explicit_limit &&
+        parameters->limit_params.offset_limit)
     {
       auto offset= emit_integer_constant(parameters->limit_params.offset_limit);
       if (!offset.supported())
@@ -452,6 +514,26 @@ private:
     }
 
     return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  bool should_suppress_positive_limit(st_select_lex *sel_lex, bool suppress_positive_limit)
+  {
+    return suppress_positive_limit && sel_lex && sel_lex->limit_params.explicit_limit &&
+           sel_lex->limit_params.select_limit && !sel_lex->limit_params.offset_limit &&
+           is_positive_integer_constant(sel_lex->limit_params.select_limit);
+  }
+
+  bool is_positive_integer_constant(Item *item)
+  {
+    if (!item)
+      return false;
+    const Item_const *constant= item->get_item_const();
+    if (constant)
+    {
+      if (const longlong *value= constant->const_ptr_longlong())
+        return *value > 0;
+    }
+    return item->const_item() && item->result_type() == INT_RESULT && item->val_int() > 0;
   }
 
   SqlGenerationResult emit_order_list(ORDER *order, bool include_direction)
@@ -487,6 +569,21 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
+  SqlGenerationResult emit_olap_group_prefix(st_select_lex *sel_lex)
+  {
+    switch (sel_lex->olap)
+    {
+      case UNSPECIFIED_OLAP_TYPE:
+        return SqlGenerationResult::generated(std::string());
+      case ROLLUP_TYPE:
+        return SqlGenerationResult::generated("ROLLUP(");
+      case CUBE_TYPE:
+        return unsupported("GROUP BY CUBE emission is not implemented yet");
+      default:
+        return unsupported("unknown OLAP grouping type");
+    }
+  }
+
   SqlGenerationResult emit_expression(Item *item)
   {
     if (!item)
@@ -508,6 +605,10 @@ private:
         return emit_condition(static_cast<Item_cond *>(item));
       case Item::SUM_FUNC_ITEM:
         return emit_aggregate(static_cast<Item_sum *>(item));
+      case Item::WINDOW_FUNC_ITEM:
+        return emit_window_function(static_cast<Item_window_func *>(item));
+      case Item::SUBSELECT_ITEM:
+        return emit_subselect(static_cast<Item_subselect *>(item));
       default:
         return unsupported("unsupported MariaDB Item type");
     }
@@ -550,6 +651,8 @@ private:
       return unsupported("unsupported constant expression");
     if (constant->const_is_null())
       return SqlGenerationResult::generated("NULL");
+    if (const MYSQL_TIME *value= constant->const_ptr_mysql_time())
+      return temporal_to_sql(*value, item->decimals);
     if (const longlong *value= constant->const_ptr_longlong())
       return SqlGenerationResult::generated(integer_to_string(*value));
     if (const my_decimal *value= constant->const_ptr_my_decimal())
@@ -593,7 +696,7 @@ private:
       case Item_func::GT_FUNC:
         return emit_binary_function(function, ">");
       case Item_func::LIKE_FUNC:
-        return emit_binary_function(function, "LIKE");
+        return emit_like_function(static_cast<Item_func_like *>(function));
       case Item_func::ISNULL_FUNC:
         return emit_unary_suffix_function(function, "IS NULL");
       case Item_func::ISNOTNULL_FUNC:
@@ -610,8 +713,20 @@ private:
         return emit_in_function(function);
       case Item_func::NEG_FUNC:
         return emit_unary_prefix_function(function, "-");
+      case Item_func::EXTRACT_FUNC:
+        return emit_extract_function(static_cast<Item_extract *>(function));
+      case Item_func::DATE_FUNC:
+        return emit_unary_cast_function(function, "DATE");
+      case Item_func::CHAR_TYPECAST_FUNC:
+        return emit_char_typecast_function(static_cast<Item_char_typecast *>(function));
       case Item_func::YEAR_FUNC:
         return emit_extract_function(function, "YEAR");
+      case Item_func::CASE_SEARCHED_FUNC:
+        return emit_searched_case_function(function);
+      case Item_func::CASE_SIMPLE_FUNC:
+        return emit_simple_case_function(function);
+      case Item_func::IN_OPTIMIZER_FUNC:
+        return emit_in_optimizer_function(function);
       case Item_func::EQUAL_FUNC:
         return unsupported("NULL-safe equality emission is not implemented yet");
       default:
@@ -663,6 +778,21 @@ private:
   SqlGenerationResult emit_named_or_operator_function(Item_func *function)
   {
     const LEX_CSTRING name= function->func_name_cstring();
+    if (equals_ignore_case(name, "date_add_interval"))
+      return emit_date_add_interval_function(static_cast<Item_date_add_interval *>(function));
+    if (equals_ignore_case(name, "cast_as_signed"))
+      return emit_unary_cast_function(function, "DECIMAL(18,0)");
+    if (equals_ignore_case(name, "cast_as_unsigned"))
+      return emit_unary_cast_function(function, "DECIMAL(20,0)");
+    if (equals_ignore_case(name, "decimal_typecast"))
+      return emit_decimal_typecast_function(static_cast<Item_decimal_typecast *>(function));
+    if (equals_ignore_case(name, "float_typecast") || equals_ignore_case(name, "double_typecast"))
+      return emit_unary_cast_function(function, "DOUBLE");
+    if (equals_ignore_case(name, "cast_as_time"))
+      return emit_unary_cast_function(function, "TIME");
+    if (equals_ignore_case(name, "cast_as_datetime"))
+      return emit_unary_cast_function(function, "TIMESTAMP");
+
     if (equals_ignore_case(name, "ifnull"))
       return emit_named_function(function, "IFNULL");
     if (equals_ignore_case(name, "coalesce"))
@@ -681,6 +811,8 @@ private:
       return emit_named_function(function, "SUBSTR");
     if (equals_ignore_case(name, "mod"))
       return emit_named_function(function, "MOD");
+    if (equals_ignore_case(name, "round"))
+      return emit_named_function(function, "ROUND");
 
     if (name.length == 1)
     {
@@ -698,7 +830,13 @@ private:
           break;
       }
     }
-    return unsupported("unsupported scalar function");
+    std::string reason= "unsupported scalar function";
+    if (!is_empty(name))
+    {
+      reason+= ": ";
+      reason+= string_from(name);
+    }
+    return SqlGenerationResult::unsupported(std::move(reason));
   }
 
   SqlGenerationResult emit_named_function(Item_func *function, const char *function_name)
@@ -720,6 +858,85 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
+  SqlGenerationResult emit_searched_case_function(Item_func *function)
+  {
+    if (function->argument_count() < 2)
+      return unsupported("searched CASE has too few arguments");
+
+    const uint when_count= function->argument_count() / 2;
+    const bool with_else= function->argument_count() % 2 == 1;
+
+    std::string sql= "CASE";
+    for (uint i= 0; i < when_count; ++i)
+    {
+      auto condition= emit_expression(function->arguments()[i]);
+      if (!condition.supported())
+        return condition;
+      auto result= emit_expression(function->arguments()[i + when_count]);
+      if (!result.supported())
+        return result;
+
+      sql+= " WHEN ";
+      sql+= condition.sql;
+      sql+= " THEN ";
+      sql+= result.sql;
+    }
+
+    if (with_else)
+    {
+      auto else_result= emit_expression(function->arguments()[function->argument_count() - 1]);
+      if (!else_result.supported())
+        return else_result;
+      sql+= " ELSE ";
+      sql+= else_result.sql;
+    }
+
+    sql+= " END";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_simple_case_function(Item_func *function)
+  {
+    if (function->argument_count() < 3)
+      return unsupported("simple CASE has too few arguments");
+
+    const uint when_count= (function->argument_count() - 1) / 2;
+    const bool with_else= function->argument_count() % 2 == 0;
+
+    auto value= emit_expression(function->arguments()[0]);
+    if (!value.supported())
+      return value;
+
+    std::string sql= "CASE ";
+    sql+= value.sql;
+    for (uint i= 0; i < when_count; ++i)
+    {
+      auto when_value= emit_expression(function->arguments()[1 + i]);
+      if (!when_value.supported())
+        return when_value;
+      auto result= emit_expression(function->arguments()[1 + when_count + i]);
+      if (!result.supported())
+        return result;
+
+      sql+= " WHEN ";
+      sql+= when_value.sql;
+      sql+= " THEN ";
+      sql+= result.sql;
+    }
+
+    if (with_else)
+    {
+      auto else_result= emit_expression(function->arguments()[function->argument_count() - 1]);
+      if (!else_result.supported())
+        return else_result;
+      sql+= " ELSE ";
+      sql+= else_result.sql;
+    }
+
+    sql+= " END";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
   SqlGenerationResult emit_extract_function(Item_func *function, const char *field_name)
   {
     if (function->argument_count() != 1)
@@ -729,6 +946,134 @@ private:
       return expression;
     return SqlGenerationResult::generated("EXTRACT(" + std::string(field_name) + " FROM " +
                                           expression.sql + ")");
+  }
+
+  SqlGenerationResult emit_extract_function(Item_extract *function)
+  {
+    if (function->argument_count() != 1)
+      return unsupported("EXTRACT function has unexpected argument count");
+
+    const char *field_name= interval_unit_name(function->int_type);
+    if (!field_name)
+      return unsupported("unsupported EXTRACT interval unit");
+
+    auto expression= emit_expression(function->arguments()[0]);
+    if (!expression.supported())
+      return expression;
+    return SqlGenerationResult::generated("EXTRACT(" + std::string(field_name) + " FROM " +
+                                          expression.sql + ")");
+  }
+
+  SqlGenerationResult emit_unary_cast_function(Item_func *function, const char *type_name)
+  {
+    if (function->argument_count() != 1)
+      return unsupported("CAST has unexpected argument count");
+    auto expression= emit_expression(function->arguments()[0]);
+    if (!expression.supported())
+      return expression;
+    return SqlGenerationResult::generated("CAST(" + expression.sql + " AS " +
+                                          std::string(type_name) + ")");
+  }
+
+  SqlGenerationResult emit_decimal_typecast_function(Item_decimal_typecast *function)
+  {
+    if (function->argument_count() != 1)
+      return unsupported("DECIMAL cast has unexpected argument count");
+    auto expression= emit_expression(function->arguments()[0]);
+    if (!expression.supported())
+      return expression;
+
+    const uint precision=
+        my_decimal_length_to_precision(function->max_length, function->decimals,
+                                       function->unsigned_flag);
+    return SqlGenerationResult::generated("CAST(" + expression.sql + " AS DECIMAL(" +
+                                          integer_to_string(precision) + "," +
+                                          integer_to_string(function->decimals) + "))");
+  }
+
+  SqlGenerationResult emit_char_typecast_function(Item_char_typecast *function)
+  {
+    if (function->argument_count() != 1)
+      return unsupported("CHAR cast has unexpected argument count");
+    if (!function->has_explicit_length())
+      return unsupported("CHAR cast without explicit length is not supported");
+
+    auto expression= emit_expression(function->arguments()[0]);
+    if (!expression.supported())
+      return expression;
+    return SqlGenerationResult::generated("CAST(" + expression.sql + " AS VARCHAR(" +
+                                          integer_to_string(function->get_cast_length()) + "))");
+  }
+
+  SqlGenerationResult emit_date_add_interval_function(Item_date_add_interval *function)
+  {
+    if (function->argument_count() != 2)
+      return unsupported("date interval arithmetic has unexpected argument count");
+
+    const char *field_name= interval_unit_name(function->int_type);
+    if (!field_name)
+      return unsupported("unsupported date interval unit");
+
+    auto date_expression= emit_expression(function->arguments()[0]);
+    if (!date_expression.supported())
+      return date_expression;
+    auto interval_value= emit_interval_literal_value(function->arguments()[1]);
+    if (!interval_value.supported())
+      return interval_value;
+
+    std::string sql= "(";
+    sql+= date_expression.sql;
+    sql+= function->date_sub_interval ? " - INTERVAL " : " + INTERVAL ";
+    sql+= interval_value.sql;
+    sql+= " ";
+    sql+= field_name;
+    sql+= ")";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_interval_literal_value(Item *item)
+  {
+    if (!item)
+      return unsupported("missing interval literal");
+
+    const Item_const *constant= item->get_item_const();
+    if (!constant || constant->const_is_null())
+      return unsupported("non-constant interval expression is not supported");
+
+    if (const longlong *value= constant->const_ptr_longlong())
+      return SqlGenerationResult::generated("'" + integer_to_string(*value) + "'");
+    if (const my_decimal *value= constant->const_ptr_my_decimal())
+    {
+      auto decimal= decimal_to_sql(*value);
+      if (!decimal.supported())
+        return decimal;
+      return SqlGenerationResult::generated("'" + decimal.sql + "'");
+    }
+    if (const String *value= constant->const_ptr_string())
+      return SqlGenerationResult::generated(quote_string(*value));
+
+    return unsupported("unsupported interval literal");
+  }
+
+  const char *interval_unit_name(interval_type type)
+  {
+    switch (type)
+    {
+      case INTERVAL_YEAR:
+        return "YEAR";
+      case INTERVAL_MONTH:
+        return "MONTH";
+      case INTERVAL_DAY:
+        return "DAY";
+      case INTERVAL_HOUR:
+        return "HOUR";
+      case INTERVAL_MINUTE:
+        return "MINUTE";
+      case INTERVAL_SECOND:
+        return "SECOND";
+      default:
+        return nullptr;
+    }
   }
 
   SqlGenerationResult emit_binary_function(Item_func *function, const char *operator_text)
@@ -743,6 +1088,22 @@ private:
       return right;
 
     return SqlGenerationResult::generated("(" + left.sql + " " + operator_text + " " +
+                                          right.sql + ")");
+  }
+
+  SqlGenerationResult emit_like_function(Item_func_like *function)
+  {
+    if (function->argument_count() != 2)
+      return unsupported("LIKE function has unexpected argument count");
+    auto left= emit_expression(function->arguments()[0]);
+    if (!left.supported())
+      return left;
+    auto right= emit_expression(function->arguments()[1]);
+    if (!right.supported())
+      return right;
+
+    return SqlGenerationResult::generated("(" + left.sql +
+                                          (function->get_negated() ? " NOT LIKE " : " LIKE ") +
                                           right.sql + ")");
   }
 
@@ -828,6 +1189,49 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
+  SqlGenerationResult emit_in_optimizer_function(Item_func *function)
+  {
+    if (function->argument_count() != 2)
+      return unsupported("IN optimizer has unexpected argument count");
+    return emit_expression(function->arguments()[1]);
+  }
+
+  SqlGenerationResult emit_subselect(Item_subselect *subselect)
+  {
+    if (!subselect || !subselect->unit)
+      return unsupported("subquery has no SELECT unit");
+
+    const bool suppress_exists_limit= subselect->substype() == Item_subselect::EXISTS_SUBS;
+    auto unit= generate_unit(subselect->unit, suppress_exists_limit);
+    if (!unit.supported())
+      return unit;
+
+    switch (subselect->substype())
+    {
+      case Item_subselect::SINGLEROW_SUBS:
+        return SqlGenerationResult::generated("(" + unit.sql + ")");
+      case Item_subselect::EXISTS_SUBS:
+        return SqlGenerationResult::generated("EXISTS (" + unit.sql + ")");
+      case Item_subselect::IN_SUBS:
+        return emit_in_subselect(subselect, unit.sql);
+      default:
+        return unsupported("unsupported subquery type");
+    }
+  }
+
+  SqlGenerationResult emit_in_subselect(Item_subselect *subselect, const std::string &unit_sql)
+  {
+    Item_in_subselect *in_subselect= subselect->get_IN_subquery();
+    if (!in_subselect)
+      return unsupported("IN subquery has no left expression");
+
+    auto left= emit_expression(in_subselect->left_exp());
+    if (!left.supported())
+      return left;
+
+    return SqlGenerationResult::generated("(" + left.sql + " IN (" + unit_sql + "))");
+  }
+
   SqlGenerationResult emit_aggregate(Item_sum *aggregate)
   {
     const char *function_name= nullptr;
@@ -862,6 +1266,9 @@ private:
       case Item_sum::MAX_FUNC:
         function_name= "MAX";
         break;
+      case Item_sum::STD_FUNC:
+        function_name= static_cast<Item_sum_std *>(aggregate)->sample ? "STDDEV_SAMP" : "STDDEV";
+        break;
       default:
         return unsupported("unsupported aggregate function");
     }
@@ -886,6 +1293,191 @@ private:
     }
 
     sql+= ")";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_window_function(Item_window_func *window)
+  {
+    if (!window || !window->window_func())
+      return unsupported("window function has no aggregate function");
+    if (!window->window_spec)
+      return unsupported("named window references are not implemented yet");
+
+    auto function= emit_window_function_call(window->window_func());
+    if (!function.supported())
+      return function;
+    auto specification= emit_window_spec(window->window_spec);
+    if (!specification.supported())
+      return specification;
+
+    return SqlGenerationResult::generated(function.sql + " OVER " + specification.sql);
+  }
+
+  SqlGenerationResult emit_window_function_call(Item_sum *function)
+  {
+    const char *function_name= nullptr;
+    bool distinct= false;
+    bool empty_argument_list= false;
+
+    switch (function->sum_func())
+    {
+      case Item_sum::COUNT_FUNC:
+        function_name= "COUNT";
+        break;
+      case Item_sum::COUNT_DISTINCT_FUNC:
+        function_name= "COUNT";
+        distinct= true;
+        break;
+      case Item_sum::SUM_FUNC:
+        function_name= "SUM";
+        break;
+      case Item_sum::SUM_DISTINCT_FUNC:
+        function_name= "SUM";
+        distinct= true;
+        break;
+      case Item_sum::AVG_FUNC:
+        function_name= "AVG";
+        break;
+      case Item_sum::AVG_DISTINCT_FUNC:
+        function_name= "AVG";
+        distinct= true;
+        break;
+      case Item_sum::MIN_FUNC:
+        function_name= "MIN";
+        break;
+      case Item_sum::MAX_FUNC:
+        function_name= "MAX";
+        break;
+      case Item_sum::STD_FUNC:
+        function_name= static_cast<Item_sum_std *>(function)->sample ? "STDDEV_SAMP" : "STDDEV";
+        break;
+      case Item_sum::ROW_NUMBER_FUNC:
+        function_name= "ROW_NUMBER";
+        empty_argument_list= true;
+        break;
+      case Item_sum::RANK_FUNC:
+        function_name= "RANK";
+        empty_argument_list= true;
+        break;
+      case Item_sum::DENSE_RANK_FUNC:
+        function_name= "DENSE_RANK";
+        empty_argument_list= true;
+        break;
+      default:
+        return unsupported("unsupported window function");
+    }
+
+    std::string sql= std::string(function_name) + "(";
+    if (distinct)
+      sql+= "DISTINCT ";
+
+    if (empty_argument_list)
+    {
+      if (function->argument_count() != 0)
+        return unsupported("ranking window function unexpectedly has arguments");
+    }
+    else if (function->argument_count() == 0)
+      sql+= "*";
+    else
+    {
+      for (uint i= 0; i < function->argument_count(); ++i)
+      {
+        auto expression= emit_expression(function->arguments()[i]);
+        if (!expression.supported())
+          return expression;
+        if (i > 0)
+          sql+= ", ";
+        sql+= expression.sql;
+      }
+    }
+
+    sql+= ")";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_window_spec(Window_spec *specification)
+  {
+    std::string sql= "(";
+    bool need_space= false;
+
+    if (specification->partition_list && specification->partition_list->elements)
+    {
+      auto partition_by= emit_order_list(specification->partition_list->first, false);
+      if (!partition_by.supported())
+        return partition_by;
+      sql+= "PARTITION BY ";
+      sql+= partition_by.sql;
+      need_space= true;
+    }
+
+    if (specification->order_list && specification->order_list->elements)
+    {
+      auto order_by= emit_order_list(specification->order_list->first, true);
+      if (!order_by.supported())
+        return order_by;
+      if (need_space)
+        sql+= " ";
+      sql+= "ORDER BY ";
+      sql+= order_by.sql;
+      need_space= true;
+    }
+
+    if (specification->window_frame)
+    {
+      auto frame= emit_window_frame(specification->window_frame);
+      if (!frame.supported())
+        return frame;
+      if (need_space)
+        sql+= " ";
+      sql+= frame.sql;
+    }
+
+    sql+= ")";
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_window_frame(Window_frame *frame)
+  {
+    if (frame->exclusion != Window_frame::EXCL_NONE)
+      return unsupported("window frame exclusion is not implemented yet");
+
+    auto top_bound= emit_window_frame_bound(frame->top_bound);
+    if (!top_bound.supported())
+      return top_bound;
+    auto bottom_bound= emit_window_frame_bound(frame->bottom_bound);
+    if (!bottom_bound.supported())
+      return bottom_bound;
+
+    std::string sql= frame->units == Window_frame::UNITS_ROWS ? "ROWS" : "RANGE";
+    sql+= " BETWEEN ";
+    sql+= top_bound.sql;
+    sql+= " AND ";
+    sql+= bottom_bound.sql;
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_window_frame_bound(Window_frame_bound *bound)
+  {
+    if (!bound)
+      return unsupported("missing window frame bound");
+
+    if (bound->precedence_type == Window_frame_bound::CURRENT)
+      return SqlGenerationResult::generated("CURRENT ROW");
+
+    if (bound->is_unbounded())
+    {
+      if (bound->precedence_type == Window_frame_bound::PRECEDING)
+        return SqlGenerationResult::generated("UNBOUNDED PRECEDING");
+      if (bound->precedence_type == Window_frame_bound::FOLLOWING)
+        return SqlGenerationResult::generated("UNBOUNDED FOLLOWING");
+      return unsupported("unbounded CURRENT ROW window frame bound is invalid");
+    }
+
+    auto offset= emit_expression(bound->offset);
+    if (!offset.supported())
+      return offset;
+    std::string sql= offset.sql;
+    sql+= bound->precedence_type == Window_frame_bound::PRECEDING ? " PRECEDING" : " FOLLOWING";
     return SqlGenerationResult::generated(std::move(sql));
   }
 
