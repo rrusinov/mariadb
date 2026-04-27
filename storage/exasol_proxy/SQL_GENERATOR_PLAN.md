@@ -48,6 +48,8 @@ being imported.
 6. Add SQLGlot reference tests.
    Use a local SQLGlot checkout as an optional offline oracle for renderer decisions where SQLGlot
    and the MariaDB AST generator overlap. This must stay out of the proxy runtime path.
+   Implemented by `Server/test/mariadb/test_mariadb_proxy_sqlglot_reference`; set
+   `SQLGLOT_SRC=/path/to/sqlglot` or let the script skip when no checkout is present.
 
 ## Runtime Boundary
 
@@ -55,7 +57,10 @@ Direct row/iterator paths must continue to use the storage-engine/core readable 
 The SQL generator is only for higher-level pushdown logic where MariaDB asks the storage engine to
 execute a logical query.
 
-## Open Semantic Decisions
+## Semantic Decisions
 
-- `ORDER BY` NULL ordering: the existing proxy behavior follows Exasol defaults. MariaDB-exact
-  NULL ordering would require explicit handling, especially for positional `ORDER BY`.
+- `ORDER BY` NULL ordering: generated EXASOL SQL intentionally follows Exasol defaults
+  (`NULLS LAST`) instead of injecting MariaDB-style `ASC NULLS FIRST`. This preserves the existing
+  proxy behavior and avoids unsafe rewriting of positional `ORDER BY` terms. Queries that require
+  MariaDB-compatible ascending NULL placement can express it explicitly with sort keys such as
+  `expr IS NULL, expr`.
