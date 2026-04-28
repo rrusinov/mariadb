@@ -3,11 +3,17 @@
 
 #include <string>
 #include <utility>
+#include <functional>
 
 class THD;
 struct st_order;
 class st_select_lex;
 class st_select_lex_unit;
+class Item;
+class Item_func;
+class Item_sum;
+class Item_window_func;
+class Item_subselect;
 
 namespace exasol_proxy
 {
@@ -33,6 +39,11 @@ struct SqlGenerationResult
     return result;
   }
 };
+
+typedef std::function<SqlGenerationResult(Item_func *)> FuncTransform;
+typedef std::function<SqlGenerationResult(Item_sum *)> AggregateTransform;
+typedef std::function<SqlGenerationResult(Item_window_func *)> WindowTransform;
+typedef std::function<SqlGenerationResult(Item_subselect *)> SubqueryTransform;
 
 SqlGenerationResult generate_exasol_sql(THD *thd, st_select_lex_unit *lex_unit);
 SqlGenerationResult generate_exasol_sql(THD *thd, st_select_lex *sel_lex);

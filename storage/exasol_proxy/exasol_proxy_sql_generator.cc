@@ -149,6 +149,18 @@ class Generator
 public:
   explicit Generator(THD *thd_arg) : thd(thd_arg) {}
 
+  static void register_transforms()
+  {
+    // Function transforms (mirrors SQLGlot TRANSFORMS pattern)
+    // TODO: Populate function_transforms with MariaDB Item_func::functype → translator
+    // TODO: Populate aggregate_transforms with MariaDB aggregate type → translator
+    // TODO: Populate window_transforms with MariaDB window type → translator
+    
+    // Example pattern:
+    // function_transforms[Item_func::BETWEEN] = [](Item_func *f) { return emit_between_function(f); };
+    // function_transforms[Item_func::LIKE] = [](Item_func *f) { return emit_like_function(f); };
+  }
+
   SqlGenerationResult generate_order_sql(ORDER *order)
   {
     if (!thd)
@@ -168,6 +180,15 @@ public:
 
 private:
   THD *thd;
+
+  // SQLGlot-style TRANSFORMS dispatch tables
+  // Maps MariaDB Item types → Translator lambdas
+  static inline std::map<int, FuncTransform> function_transforms;
+  static inline std::map<int, AggregateTransform> aggregate_transforms;
+  static inline std::map<int, WindowTransform> window_transforms;
+  static inline std::map<int, SubqueryTransform> subquery_transforms;
+
+  SqlGenerationResult dispatch_function(Item_func *function);
 
   SqlGenerationResult generate_unit(st_select_lex_unit *lex_unit, bool suppress_positive_limit)
   {
@@ -714,6 +735,22 @@ private:
     return unsupported("non-integer LIMIT/OFFSET expression is not supported");
   }
 
+  SqlGenerationResult dispatch_function(Item_func *function)
+  {
+    // SQLGlot-style dispatch: look up in TRANSFORMS table first
+    auto it = function_transforms.find(function->functype());
+    if (it != function_transforms.end())
+    {
+      return it->second(function);
+    }
+    
+    // Fallback: emit function using switch (for gradual migration)
+    // TODO: Remove this fallback once all functions migrated to TRANSFORMS
+    return emit_function(function);
+  }
+
+  // Legacy emit_function - keep for gradual migration
+  // TODO: Migrate each case to TRANSFORMS and remove this
   SqlGenerationResult emit_function(Item_func *function)
   {
     switch (function->functype())
@@ -1530,6 +1567,25 @@ private:
   static SqlGenerationResult unsupported(const char *reason)
   {
     return SqlGenerationResult::unsupported(reason);
+  }
+
+  // Initialize TRANSFORMS tables (called once at startup)
+  static void init_transforms()
+  {
+    // Function transforms - mirrors SQLGlot EXASOLGenerator.TRANSFORMS
+    function_transforms = {
+      // Comparison operators
+      {Item_func::EQ_FUNC, [](Item_func *f) { return emit_binary_function(f, "="); }},
+      {Item_func::NE_FUNC, [](Item_func *f) { return emit_binary_function(f, "<>"); }},
+      {Item_func::LT_FUNC, [](Item_func *f) { return emit_binary_function(f, "<"); }},
+      {Item_func::LE_FUNC, [](Item_func *f) { return emit_binary_function(f, "<="); }},
+      {Item_func::GE_FUNC, [](Item_func *f) { return emit_binary_function(f, ">="); }},
+      {Item_func::GT_FUNC, [](Item_func *f) { return emit_binary_function(f, ">"); }},
+      
+      // Add more here: like SQLGlot pattern
+      // {Item_func::BETWEEN, [](Item_func *f) { return emit_between_function(f); }},
+      // {Item_func::LIKE_FUNC, [](Item_func *f) { return emit_like_function(f); }},
+    };
   }
 };
 
