@@ -64,3 +64,14 @@ execute a logical query.
   proxy behavior and avoids unsafe rewriting of positional `ORDER BY` terms. Queries that require
   MariaDB-compatible ascending NULL placement can express it explicitly with sort keys such as
   `expr IS NULL, expr`.
+- `RIGHT JOIN`: MariaDB normalizes simple right joins internally by swapping the inputs and
+  carrying the original `ON` expression on the nullable side. The generator emits these simple
+  two-table shapes as equivalent `LEFT JOIN` SQL and fails closed for more complex right-join
+  arrangements.
+- `FULL OUTER JOIN`: raw syntax is not handled by the generator because MariaDB does not expose it
+  as a supported AST shape. TPC-DS q51/q97-style cases are covered by explicit
+  matched-rows plus anti-semi `UNION ALL` rewrites that use generator-supported set operation,
+  comma join, and `NOT EXISTS` nodes.
+- `GROUPING()`: raw function syntax is not handled by the generator. TPC-DS q27/q36/q70/q86-style
+  cases are covered by explicit `WITH ROLLUP` plus `CASE ... IS NULL` marker rewrites for compact
+  fixtures whose hierarchy keys are non-null.

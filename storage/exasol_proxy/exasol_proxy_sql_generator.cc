@@ -370,10 +370,19 @@ private:
 
   SqlGenerationResult emit_table_list(SQL_I_List<TABLE_LIST> &tables)
   {
+    if (tables.first && (tables.first->outer_join & JOIN_TYPE_RIGHT))
+    {
+      if (!tables.first->next_local || tables.first->next_local->next_local)
+        return unsupported("RIGHT JOIN emission is only implemented for simple two-table joins");
+      return emit_simple_right_join(tables.first, tables.first->next_local);
+    }
+
     std::string sql;
     bool first= true;
     for (TABLE_LIST *table= tables.first; table; table= table->next_local)
     {
+      if (table->outer_join & JOIN_TYPE_RIGHT)
+        return unsupported("RIGHT JOIN emission is only implemented for simple two-table joins");
       if (table->nested_join)
         return unsupported("nested join emission is not implemented yet");
       if (table->table_function)
@@ -387,7 +396,9 @@ private:
 
       if (!first)
       {
-        if (table->on_expr || table->outer_join)
+        const bool real_outer_join=
+            (table->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) != 0;
+        if (table->on_expr || real_outer_join)
         {
           auto join_keyword= emit_join_keyword(table);
           if (!join_keyword.supported())
@@ -415,6 +426,36 @@ private:
       first= false;
       sql+= table_ref.sql;
     }
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_simple_right_join(TABLE_LIST *left_table, TABLE_LIST *right_table)
+  {
+    if (left_table->nested_join || right_table->nested_join)
+      return unsupported("nested RIGHT JOIN emission is not implemented yet");
+    if (left_table->table_function || right_table->table_function)
+      return unsupported("table function emission is not supported");
+    if (left_table->natural_join || left_table->join_using_fields ||
+        right_table->natural_join || right_table->join_using_fields)
+      return unsupported("NATURAL/USING RIGHT JOIN emission is not implemented yet");
+    if (!left_table->on_expr)
+      return unsupported("RIGHT JOIN without ON expression is not supported");
+
+    auto right_ref= emit_table_ref(right_table);
+    if (!right_ref.supported())
+      return right_ref;
+    auto left_ref= emit_table_ref(left_table);
+    if (!left_ref.supported())
+      return left_ref;
+    auto condition= emit_expression(left_table->on_expr);
+    if (!condition.supported())
+      return condition;
+
+    std::string sql= right_ref.sql;
+    sql+= " LEFT JOIN ";
+    sql+= left_ref.sql;
+    sql+= " ON ";
+    sql+= condition.sql;
     return SqlGenerationResult::generated(std::move(sql));
   }
 
@@ -457,15 +498,9 @@ private:
   SqlGenerationResult emit_join_keyword(TABLE_LIST *table)
   {
     std::string sql;
-    if (table->outer_join)
-    {
-      if (table->outer_join & JOIN_TYPE_LEFT)
-        sql+= "LEFT JOIN";
-      else if (table->outer_join & JOIN_TYPE_RIGHT)
-        sql+= "RIGHT JOIN";
-      else
-        return unsupported("unknown outer join type");
-    }
+    const uint outer_join_type= table->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT);
+    if (outer_join_type)
+      sql+= "LEFT JOIN";
     else
       sql+= "JOIN";
 
