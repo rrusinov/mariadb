@@ -737,73 +737,15 @@ private:
 
   SqlGenerationResult dispatch_function(Item_func *function)
   {
-    // SQLGlot-style dispatch: look up in TRANSFORMS table first
+    // SQLGlot-style dispatch: look up in TRANSFORMS table
     auto it = function_transforms.find(function->functype());
     if (it != function_transforms.end())
     {
       return it->second(function);
     }
     
-    // Fallback: emit function using switch (for gradual migration)
-    // TODO: Remove this fallback once all functions migrated to TRANSFORMS
-    return emit_function(function);
-  }
-
-  // Legacy emit_function - keep for gradual migration
-  // TODO: Migrate each case to TRANSFORMS and remove this
-  SqlGenerationResult emit_function(Item_func *function)
-  {
-    switch (function->functype())
-    {
-      case Item_func::EQ_FUNC:
-        return emit_binary_function(function, "=");
-      case Item_func::NE_FUNC:
-        return emit_binary_function(function, "<>");
-      case Item_func::LT_FUNC:
-        return emit_binary_function(function, "<");
-      case Item_func::LE_FUNC:
-        return emit_binary_function(function, "<=");
-      case Item_func::GE_FUNC:
-        return emit_binary_function(function, ">=");
-      case Item_func::GT_FUNC:
-        return emit_binary_function(function, ">");
-      case Item_func::LIKE_FUNC:
-        return emit_like_function(static_cast<Item_func_like *>(function));
-      case Item_func::ISNULL_FUNC:
-        return emit_unary_suffix_function(function, "IS NULL");
-      case Item_func::ISNOTNULL_FUNC:
-        return emit_unary_suffix_function(function, "IS NOT NULL");
-      case Item_func::COND_AND_FUNC:
-        return emit_variadic_infix_function(function, "AND");
-      case Item_func::COND_OR_FUNC:
-        return emit_variadic_infix_function(function, "OR");
-      case Item_func::NOT_FUNC:
-        return emit_unary_prefix_function(function, "NOT");
-      case Item_func::BETWEEN:
-        return emit_between_function(function);
-      case Item_func::IN_FUNC:
-        return emit_in_function(function);
-      case Item_func::NEG_FUNC:
-        return emit_unary_prefix_function(function, "-");
-      case Item_func::EXTRACT_FUNC:
-        return emit_extract_function(static_cast<Item_extract *>(function));
-      case Item_func::DATE_FUNC:
-        return emit_unary_cast_function(function, "DATE");
-      case Item_func::CHAR_TYPECAST_FUNC:
-        return emit_char_typecast_function(static_cast<Item_char_typecast *>(function));
-      case Item_func::YEAR_FUNC:
-        return emit_extract_function(function, "YEAR");
-      case Item_func::CASE_SEARCHED_FUNC:
-        return emit_searched_case_function(function);
-      case Item_func::CASE_SIMPLE_FUNC:
-        return emit_simple_case_function(function);
-      case Item_func::IN_OPTIMIZER_FUNC:
-        return emit_in_optimizer_function(function);
-      case Item_func::EQUAL_FUNC:
-        return unsupported("NULL-safe equality emission is not implemented yet");
-      default:
-        return emit_named_or_operator_function(function);
-    }
+    // Default handler for unmapped functions
+    return emit_named_or_operator_function(function);
   }
 
   SqlGenerationResult emit_condition(Item_cond *condition)
@@ -1603,6 +1545,22 @@ private:
       // CASE expressions
       {Item_func::CASE_SEARCHED_FUNC, [](Item_func *f) { return emit_searched_case_function(f); }},
       {Item_func::CASE_SIMPLE_FUNC, [](Item_func *f) { return emit_simple_case_function(f); }},
+      
+      // Pattern matching
+      {Item_func::LIKE_FUNC, [](Item_func *f) { return emit_like_function(static_cast<Item_func_like *>(f)); }},
+      
+      // Range/between
+      {Item_func::BETWEEN, [](Item_func *f) { return emit_between_function(f); }},
+      
+      // Set membership
+      {Item_func::IN_FUNC, [](Item_func *f) { return emit_in_function(f); }},
+      {Item_func::IN_OPTIMIZER_FUNC, [](Item_func *f) { return emit_in_optimizer_function(f); }},
+      
+      // EXTRACT function
+      {Item_func::EXTRACT_FUNC, [](Item_func *f) { return emit_extract_function(static_cast<Item_extract *>(f)); }},
+      
+      // NULL-safe equality (not supported)
+      {Item_func::EQUAL_FUNC, [](Item_func *f) { return SqlGenerationResult::unsupported("NULL-safe equality emission is not implemented yet"); }},
     };
     
     aggregate_transforms = {
