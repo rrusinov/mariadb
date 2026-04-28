@@ -1573,6 +1573,7 @@ private:
   static void init_transforms()
   {
     // Function transforms - mirrors SQLGlot EXASOLGenerator.TRANSFORMS
+    // Maps MariaDB Item_func::functype enum → translator lambda
     function_transforms = {
       // Comparison operators
       {Item_func::EQ_FUNC, [](Item_func *f) { return emit_binary_function(f, "="); }},
@@ -1582,9 +1583,35 @@ private:
       {Item_func::GE_FUNC, [](Item_func *f) { return emit_binary_function(f, ">="); }},
       {Item_func::GT_FUNC, [](Item_func *f) { return emit_binary_function(f, ">"); }},
       
-      // Add more here: like SQLGlot pattern
-      // {Item_func::BETWEEN, [](Item_func *f) { return emit_between_function(f); }},
-      // {Item_func::LIKE_FUNC, [](Item_func *f) { return emit_like_function(f); }},
+      // Null checks
+      {Item_func::ISNULL_FUNC, [](Item_func *f) { return emit_unary_suffix_function(f, "IS NULL"); }},
+      {Item_func::ISNOTNULL_FUNC, [](Item_func *f) { return emit_unary_suffix_function(f, "IS NOT NULL"); }},
+      
+      // Boolean logic
+      {Item_func::COND_AND_FUNC, [](Item_func *f) { return emit_variadic_infix_function(f, "AND"); }},
+      {Item_func::COND_OR_FUNC, [](Item_func *f) { return emit_variadic_infix_function(f, "OR"); }},
+      {Item_func::NOT_FUNC, [](Item_func *f) { return emit_unary_prefix_function(f, "NOT"); }},
+      
+      // Arithmetic
+      {Item_func::NEG_FUNC, [](Item_func *f) { return emit_unary_prefix_function(f, "-"); }},
+      
+      // Type casts (common ones)
+      {Item_func::DATE_FUNC, [](Item_func *f) { return emit_unary_cast_function(f, "DATE"); }},
+      {Item_func::CHAR_TYPECAST_FUNC, [](Item_func *f) { return emit_char_typecast_function(static_cast<Item_char_typecast *>(f)); }},
+      {Item_func::YEAR_FUNC, [](Item_func *f) { return emit_extract_function(f, "YEAR"); }},
+      
+      // CASE expressions
+      {Item_func::CASE_SEARCHED_FUNC, [](Item_func *f) { return emit_searched_case_function(f); }},
+      {Item_func::CASE_SIMPLE_FUNC, [](Item_func *f) { return emit_simple_case_function(f); }},
+    };
+    
+    aggregate_transforms = {
+      // TODO: Add aggregate function mappings
+      // Pattern: {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_aggregate(a, "SUM"); }},
+    };
+    
+    window_transforms = {
+      // TODO: Add window function mappings
     };
   }
 };
