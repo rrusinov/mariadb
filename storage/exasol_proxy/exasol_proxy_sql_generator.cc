@@ -151,14 +151,8 @@ public:
 
   static void register_transforms()
   {
-    // Function transforms (mirrors SQLGlot TRANSFORMS pattern)
-    // TODO: Populate function_transforms with MariaDB Item_func::functype → translator
-    // TODO: Populate aggregate_transforms with MariaDB aggregate type → translator
-    // TODO: Populate window_transforms with MariaDB window type → translator
-    
-    // Example pattern:
-    // function_transforms[Item_func::BETWEEN] = [](Item_func *f) { return emit_between_function(f); };
-    // function_transforms[Item_func::LIKE] = [](Item_func *f) { return emit_like_function(f); };
+    // TRANSFORMS are initialized in init_transforms() at startup
+    // See init_transforms() for complete function/aggregate/window mappings
   }
 
   SqlGenerationResult generate_order_sql(ORDER *order)
@@ -656,13 +650,13 @@ private:
       case Item::NULL_ITEM:
         return SqlGenerationResult::generated("NULL");
       case Item::FUNC_ITEM:
-        return emit_function(static_cast<Item_func *>(item));
+        return dispatch_function(static_cast<Item_func *>(item));
       case Item::COND_ITEM:
         return emit_condition(static_cast<Item_cond *>(item));
       case Item::SUM_FUNC_ITEM:
-        return emit_aggregate(static_cast<Item_sum *>(item));
+        return dispatch_aggregate(static_cast<Item_sum *>(item));
       case Item::WINDOW_FUNC_ITEM:
-        return emit_window_function(static_cast<Item_window_func *>(item));
+        return dispatch_window_function(static_cast<Item_window_func *>(item));
       case Item::SUBSELECT_ITEM:
         return emit_subselect(static_cast<Item_subselect *>(item));
       default:
@@ -733,6 +727,43 @@ private:
     if (item->const_item() && item->result_type() == INT_RESULT)
       return SqlGenerationResult::generated(integer_to_string(item->val_int()));
     return unsupported("non-integer LIMIT/OFFSET expression is not supported");
+  }
+
+  SqlGenerationResult dispatch_aggregate(Item_sum *aggregate)
+  {
+    auto it = aggregate_transforms.find(aggregate->sum_func());
+    if (it != aggregate_transforms.end())
+    {
+      return it->second(aggregate);
+    }
+    return emit_aggregate(aggregate);
+  }
+
+  SqlGenerationResult dispatch_window_function(Item_window_func *window)
+  {
+    if (!window || !window->window_func())
+      return unsupported("window function has no aggregate function");
+    auto *func = window->window_func();
+    SqlGenerationResult result;
+    auto it = window_transforms.find(func->sum_func());
+    if (it != window_transforms.end())
+    {
+      result = it->second(func);
+    }
+    else
+    {
+      result = emit_window_function_call(func);
+    }
+    if (!result.supported())
+      return result;
+    if (window->window_spec)
+    {
+      auto specification = emit_window_spec(window->window_spec);
+      if (!specification.supported())
+        return specification;
+      return SqlGenerationResult::generated(result.sql + " OVER " + specification.sql);
+    }
+    return unsupported("named window references are not implemented yet");
   }
 
   SqlGenerationResult dispatch_function(Item_func *function)
@@ -1564,12 +1595,30 @@ private:
     };
     
     aggregate_transforms = {
-      // TODO: Add aggregate function mappings
-      // Pattern: {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_aggregate(a, "SUM"); }},
+      {Item_sum::COUNT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::COUNT_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::SUM_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::AVG_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::AVG_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::MIN_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::MAX_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::STD_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
     };
     
     window_transforms = {
-      // TODO: Add window function mappings
+      {Item_sum::COUNT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::COUNT_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::SUM_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::AVG_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::AVG_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::MIN_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::MAX_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::STD_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::ROW_NUMBER_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::RANK_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::DENSE_RANK_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
     };
   }
 };
