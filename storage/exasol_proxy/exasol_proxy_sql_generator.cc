@@ -20,9 +20,12 @@
 #include "sql_window.h"
 #include "table.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace exasol_proxy
 {
@@ -39,38 +42,39 @@ std::string string_from(const LEX_CSTRING &value)
   return value.str ? std::string(value.str, value.length) : std::string();
 }
 
-bool equals_ignore_case(const LEX_CSTRING &value, const char *literal)
+std::string ascii_lower_string_from(const LEX_CSTRING &value)
 {
-  if (!value.str || !literal)
-    return false;
-  const size_t literal_length= std::strlen(literal);
-  if (value.length != literal_length)
-    return false;
-  for (size_t i= 0; i < literal_length; ++i)
-  {
-    const auto left= static_cast<unsigned char>(value.str[i]);
-    const auto right= static_cast<unsigned char>(literal[i]);
-    if (std::tolower(left) != std::tolower(right))
-      return false;
-  }
-  return true;
+  std::string lowered= string_from(value);
+  for (char &ch: lowered)
+    ch= static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return lowered;
 }
 
-std::string quote_identifier(const LEX_CSTRING &identifier)
+std::string quote_identifier(const char *identifier, size_t length)
 {
   std::string quoted{"\""};
-  if (identifier.str)
+  if (identifier)
   {
-    for (size_t i= 0; i < identifier.length; ++i)
+    for (size_t i= 0; i < length; ++i)
     {
-      if (identifier.str[i] == '"')
+      if (identifier[i] == '"')
         quoted+= "\"\"";
       else
-        quoted+= identifier.str[i];
+        quoted+= identifier[i];
     }
   }
   quoted+= '"';
   return quoted;
+}
+
+std::string quote_identifier(const LEX_CSTRING &identifier)
+{
+  return quote_identifier(identifier.str, identifier.length);
+}
+
+std::string quote_identifier(const String &identifier)
+{
+  return quote_identifier(identifier.ptr(), identifier.length());
 }
 
 std::string quote_string(const String &value)
@@ -147,7 +151,10 @@ SqlGenerationResult temporal_to_sql(const MYSQL_TIME &value, uint decimals)
 class Generator
 {
 public:
-  explicit Generator(THD *thd_arg) : thd(thd_arg) {}
+  explicit Generator(THD *thd_arg) : thd(thd_arg)
+  {
+    ensure_transforms_initialized();
+  }
 
   static void register_transforms()
   {
@@ -177,12 +184,22 @@ private:
 
   // SQLGlot-style TRANSFORMS dispatch tables
   // Maps MariaDB Item types → Translator lambdas
-  static inline std::map<int, FuncTransform> function_transforms;
-  static inline std::map<int, AggregateTransform> aggregate_transforms;
-  static inline std::map<int, WindowTransform> window_transforms;
-  static inline std::map<int, SubqueryTransform> subquery_transforms;
+  using MemberFuncTransform= std::function<SqlGenerationResult(Generator &, Item_func *)>;
+  using MemberAggregateTransform= std::function<SqlGenerationResult(Generator &, Item_sum *)>;
 
-  SqlGenerationResult dispatch_function(Item_func *function);
+  static inline std::map<int, MemberFuncTransform> function_transforms;
+  static inline std::map<std::string, MemberFuncTransform> function_name_transforms;
+  static inline std::map<int, MemberAggregateTransform> aggregate_transforms;
+  static inline std::map<int, MemberAggregateTransform> window_transforms;
+
+  static void ensure_transforms_initialized()
+  {
+    static const bool initialized= []() {
+      init_transforms();
+      return true;
+    }();
+    (void) initialized;
+  }
 
   SqlGenerationResult generate_unit(st_select_lex_unit *lex_unit, bool suppress_positive_limit)
   {
@@ -383,65 +400,114 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
-  SqlGenerationResult emit_table_list(SQL_I_List<TABLE_LIST> &tables)
+  SqlGenerationResult emit_join_sequence(const std::vector<TABLE_LIST *> &ordered_tables)
   {
-    if (tables.first && (tables.first->outer_join & JOIN_TYPE_RIGHT))
-    {
-      if (!tables.first->next_local || tables.first->next_local->next_local)
-        return unsupported("RIGHT JOIN emission is only implemented for simple two-table joins");
-      return emit_simple_right_join(tables.first, tables.first->next_local);
-    }
+    if (ordered_tables.empty())
+      return unsupported("empty table list");
+
 
     std::string sql;
-    bool first= true;
-    for (TABLE_LIST *table= tables.first; table; table= table->next_local)
+    size_t index= 0;
+
+    if (ordered_tables[0]->outer_join & JOIN_TYPE_RIGHT)
     {
+      if (ordered_tables.size() < 2)
+        return unsupported("RIGHT JOIN without right-hand table is not supported");
+
+      auto right_join= emit_simple_right_join(ordered_tables[0], ordered_tables[1]);
+      if (!right_join.supported())
+        return right_join;
+      sql= std::move(right_join.sql);
+      index= 2;
+    }
+    else
+    {
+      auto first_ref= emit_table_ref(ordered_tables[0]);
+      if (!first_ref.supported())
+        return first_ref;
+      sql= std::move(first_ref.sql);
+      index= 1;
+    }
+
+    for (; index < ordered_tables.size(); ++index)
+    {
+      TABLE_LIST *table= ordered_tables[index];
       if (table->outer_join & JOIN_TYPE_RIGHT)
-        return unsupported("RIGHT JOIN emission is only implemented for simple two-table joins");
-      if (table->nested_join)
-        return unsupported("nested join emission is not implemented yet");
+        return unsupported("RIGHT JOIN emission is only implemented for leftmost flat join pairs");
       if (table->table_function)
         return unsupported("table function emission is not supported");
-      if (table->natural_join || table->join_using_fields)
-        return unsupported("NATURAL/USING join emission is not implemented yet");
 
       auto table_ref= emit_table_ref(table);
       if (!table_ref.supported())
         return table_ref;
 
-      if (!first)
+      const bool real_outer_join=
+          (table->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) != 0;
+      if (table->on_expr || real_outer_join)
       {
-        const bool real_outer_join=
-            (table->outer_join & (JOIN_TYPE_LEFT | JOIN_TYPE_RIGHT)) != 0;
-        if (table->on_expr || real_outer_join)
+        auto join_keyword= emit_join_keyword(table);
+        if (!join_keyword.supported())
+          return join_keyword;
+        sql+= " ";
+        sql+= join_keyword.sql;
+        sql+= " ";
+        sql+= table_ref.sql;
+        if (table->on_expr)
         {
-          auto join_keyword= emit_join_keyword(table);
-          if (!join_keyword.supported())
-            return join_keyword;
-          sql+= " ";
-          sql+= join_keyword.sql;
-          sql+= " ";
-          sql+= table_ref.sql;
-          if (table->on_expr)
-          {
-            auto condition= emit_expression(table->on_expr);
-            if (!condition.supported())
-              return condition;
-            sql+= " ON ";
-            sql+= condition.sql;
-          }
-          else
-            return unsupported("outer join without ON expression is not supported");
-          first= false;
-          continue;
+          auto condition= emit_expression(table->on_expr);
+          if (!condition.supported())
+            return condition;
+          sql+= " ON ";
+          sql+= condition.sql;
         }
         else
-          sql+= ", ";
+          return unsupported("outer join without ON expression is not supported");
       }
-      first= false;
-      sql+= table_ref.sql;
+      else
+        sql+= ", " + table_ref.sql;
     }
+
     return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_join_list(List<TABLE_LIST> &tables)
+  {
+    std::vector<TABLE_LIST *> ordered_tables;
+    ordered_tables.reserve(tables.elements);
+    List_iterator_fast<TABLE_LIST> iterator(tables);
+    while (TABLE_LIST *table= iterator++)
+      ordered_tables.push_back(table);
+    std::reverse(ordered_tables.begin(), ordered_tables.end());
+    return emit_join_sequence(ordered_tables);
+  }
+
+  SqlGenerationResult emit_table_list(SQL_I_List<TABLE_LIST> &tables)
+  {
+    std::vector<TABLE_LIST *> ordered_tables;
+    for (TABLE_LIST *table= tables.first; table; table= table->next_local)
+    {
+      TABLE_LIST *representative= table;
+      bool skip_child= false;
+      while (representative->embedding && representative->embedding->nested_join &&
+             representative->embedding->embedding &&
+             (representative->embedding->on_expr || representative->embedding->outer_join ||
+              representative->embedding->is_natural_join ||
+              representative->embedding->join_using_fields ||
+              representative->embedding->natural_join))
+      {
+        TABLE_LIST *embedding= representative->embedding;
+        if (embedding->nested_join->join_list.head() != representative)
+        {
+          skip_child= true;
+          break;
+        }
+        representative= embedding;
+      }
+      if (!skip_child &&
+          (ordered_tables.empty() || ordered_tables.back() != representative))
+        ordered_tables.push_back(representative);
+    }
+    return emit_join_sequence(ordered_tables);
   }
 
   SqlGenerationResult emit_simple_right_join(TABLE_LIST *left_table, TABLE_LIST *right_table)
@@ -450,9 +516,6 @@ private:
       return unsupported("nested RIGHT JOIN emission is not implemented yet");
     if (left_table->table_function || right_table->table_function)
       return unsupported("table function emission is not supported");
-    if (left_table->natural_join || left_table->join_using_fields ||
-        right_table->natural_join || right_table->join_using_fields)
-      return unsupported("NATURAL/USING RIGHT JOIN emission is not implemented yet");
     if (!left_table->on_expr)
       return unsupported("RIGHT JOIN without ON expression is not supported");
 
@@ -474,9 +537,84 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
+  SqlGenerationResult emit_natural_or_using_join(TABLE_LIST *table)
+  {
+    std::vector<TABLE_LIST *> ordered_tables;
+    List_iterator_fast<TABLE_LIST> iterator(table->nested_join->join_list);
+    while (TABLE_LIST *child= iterator++)
+      ordered_tables.push_back(child);
+    std::reverse(ordered_tables.begin(), ordered_tables.end());
+
+    if (ordered_tables.size() != 2)
+      return unsupported("NATURAL/USING join emission expects exactly two operands");
+
+    TABLE_LIST *left_table= ordered_tables[0];
+    TABLE_LIST *right_table= ordered_tables[1];
+    if (left_table->table_function || right_table->table_function)
+      return unsupported("table function emission is not supported");
+
+    auto left_ref= emit_table_ref(left_table);
+    if (!left_ref.supported())
+      return left_ref;
+    auto right_ref= emit_table_ref(right_table);
+    if (!right_ref.supported())
+      return right_ref;
+    auto join_keyword= emit_join_keyword(right_table);
+    if (!join_keyword.supported())
+      return join_keyword;
+
+    std::string sql;
+    sql+= left_ref.sql;
+    sql+= " ";
+    if (table->is_natural_join)
+      sql+= "NATURAL ";
+    sql+= join_keyword.sql;
+    sql+= " ";
+    sql+= right_ref.sql;
+
+    if (table->join_using_fields)
+    {
+      sql+= " USING (";
+      List_iterator<String> using_iterator(*table->join_using_fields);
+      bool first= true;
+      while (String *field_name= using_iterator++)
+      {
+        if (!first)
+          sql+= ", ";
+        sql+= quote_identifier(*field_name);
+        first= false;
+      }
+      sql+= ")";
+    }
+
+    return SqlGenerationResult::generated(std::move(sql));
+  }
+
   SqlGenerationResult emit_table_ref(TABLE_LIST *table)
   {
     std::string sql;
+
+    if (table->nested_join)
+    {
+      if (table->is_natural_join || table->join_using_fields || table->natural_join)
+      {
+        auto natural_join= emit_natural_or_using_join(table);
+        if (!natural_join.supported())
+          return natural_join;
+        sql+= "(";
+        sql+= natural_join.sql;
+        sql+= ")";
+        return SqlGenerationResult::generated(std::move(sql));
+      }
+
+      auto nested_sql= emit_join_list(table->nested_join->join_list);
+      if (!nested_sql.supported())
+        return nested_sql;
+      sql+= "(";
+      sql+= nested_sql.sql;
+      sql+= ")";
+      return SqlGenerationResult::generated(std::move(sql));
+    }
 
     if (table->derived)
     {
@@ -731,11 +869,9 @@ private:
 
   SqlGenerationResult dispatch_aggregate(Item_sum *aggregate)
   {
-    auto it = aggregate_transforms.find(aggregate->sum_func());
+    auto it= aggregate_transforms.find(aggregate->sum_func());
     if (it != aggregate_transforms.end())
-    {
-      return it->second(aggregate);
-    }
+      return it->second(*this, aggregate);
     return emit_aggregate(aggregate);
   }
 
@@ -745,11 +881,9 @@ private:
       return unsupported("window function has no aggregate function");
     auto *func = window->window_func();
     SqlGenerationResult result;
-    auto it = window_transforms.find(func->sum_func());
+    auto it= window_transforms.find(func->sum_func());
     if (it != window_transforms.end())
-    {
-      result = it->second(func);
-    }
+      result= it->second(*this, func);
     else
     {
       result = emit_window_function_call(func);
@@ -768,15 +902,22 @@ private:
 
   SqlGenerationResult dispatch_function(Item_func *function)
   {
-    // SQLGlot-style dispatch: look up in TRANSFORMS table
-    auto it = function_transforms.find(function->functype());
+    auto it= function_transforms.find(function->functype());
     if (it != function_transforms.end())
+      return it->second(*this, function);
+
+    auto name_it= function_name_transforms.find(ascii_lower_string_from(function->func_name_cstring()));
+    if (name_it != function_name_transforms.end())
+      return name_it->second(*this, function);
+
+    std::string reason= "unsupported scalar function";
+    const LEX_CSTRING name= function->func_name_cstring();
+    if (!is_empty(name))
     {
-      return it->second(function);
+      reason+= ": ";
+      reason+= string_from(name);
     }
-    
-    // Default handler for unmapped functions
-    return emit_named_or_operator_function(function);
+    return SqlGenerationResult::unsupported(std::move(reason));
   }
 
   SqlGenerationResult emit_condition(Item_cond *condition)
@@ -818,70 +959,6 @@ private:
     }
     sql+= ")";
     return SqlGenerationResult::generated(std::move(sql));
-  }
-
-  SqlGenerationResult emit_named_or_operator_function(Item_func *function)
-  {
-    const LEX_CSTRING name= function->func_name_cstring();
-    if (equals_ignore_case(name, "date_add_interval"))
-      return emit_date_add_interval_function(static_cast<Item_date_add_interval *>(function));
-    if (equals_ignore_case(name, "cast_as_signed"))
-      return emit_unary_cast_function(function, "DECIMAL(18,0)");
-    if (equals_ignore_case(name, "cast_as_unsigned"))
-      return emit_unary_cast_function(function, "DECIMAL(20,0)");
-    if (equals_ignore_case(name, "decimal_typecast"))
-      return emit_decimal_typecast_function(static_cast<Item_decimal_typecast *>(function));
-    if (equals_ignore_case(name, "float_typecast") || equals_ignore_case(name, "double_typecast"))
-      return emit_unary_cast_function(function, "DOUBLE");
-    if (equals_ignore_case(name, "cast_as_time"))
-      return emit_unary_cast_function(function, "TIME");
-    if (equals_ignore_case(name, "cast_as_datetime"))
-      return emit_unary_cast_function(function, "TIMESTAMP");
-
-    if (equals_ignore_case(name, "ifnull"))
-      return emit_named_function(function, "IFNULL");
-    if (equals_ignore_case(name, "coalesce"))
-      return emit_named_function(function, "COALESCE");
-    if (equals_ignore_case(name, "concat"))
-      return emit_named_function(function, "CONCAT");
-    if (equals_ignore_case(name, "abs"))
-      return emit_named_function(function, "ABS");
-    if (equals_ignore_case(name, "lower") || equals_ignore_case(name, "lcase"))
-      return emit_named_function(function, "LOWER");
-    if (equals_ignore_case(name, "upper") || equals_ignore_case(name, "ucase"))
-      return emit_named_function(function, "UPPER");
-    if (equals_ignore_case(name, "left"))
-      return emit_named_function(function, "LEFT");
-    if (equals_ignore_case(name, "substr") || equals_ignore_case(name, "substring"))
-      return emit_named_function(function, "SUBSTR");
-    if (equals_ignore_case(name, "mod"))
-      return emit_named_function(function, "MOD");
-    if (equals_ignore_case(name, "round"))
-      return emit_named_function(function, "ROUND");
-
-    if (name.length == 1)
-    {
-      switch (name.str[0])
-      {
-        case '+':
-          return emit_binary_function(function, "+");
-        case '-':
-          return emit_binary_function(function, "-");
-        case '*':
-          return emit_binary_function(function, "*");
-        case '/':
-          return emit_binary_function(function, "/");
-        default:
-          break;
-      }
-    }
-    std::string reason= "unsupported scalar function";
-    if (!is_empty(name))
-    {
-      reason+= ": ";
-      reason+= string_from(name);
-    }
-    return SqlGenerationResult::unsupported(std::move(reason));
   }
 
   SqlGenerationResult emit_named_function(Item_func *function, const char *function_name)
@@ -991,6 +1068,35 @@ private:
       return expression;
     return SqlGenerationResult::generated("EXTRACT(" + std::string(field_name) + " FROM " +
                                           expression.sql + ")");
+  }
+
+  SqlGenerationResult emit_null_safe_equality_function(Item_func *function,
+                                                       bool numeric_result)
+  {
+    if (!function || function->argument_count() != 2)
+      return unsupported("NULL-safe equality has unexpected argument count");
+
+    auto left= emit_expression(function->arguments()[0]);
+    if (!left.supported())
+      return left;
+    auto right= emit_expression(function->arguments()[1]);
+    if (!right.supported())
+      return right;
+
+    std::string predicate= "((";
+    predicate+= left.sql;
+    predicate+= " = ";
+    predicate+= right.sql;
+    predicate+= ") OR (";
+    predicate+= left.sql;
+    predicate+= " IS NULL AND ";
+    predicate+= right.sql;
+    predicate+= " IS NULL))";
+
+    std::string sql= "(CASE WHEN ";
+    sql+= predicate;
+    sql+= numeric_result ? " THEN 1 ELSE 0 END)" : " THEN TRUE ELSE FALSE END)";
+    return SqlGenerationResult::generated(std::move(sql));
   }
 
   SqlGenerationResult emit_extract_function(Item_extract *function)
@@ -1328,7 +1434,15 @@ private:
     {
       for (uint i= 0; i < aggregate->argument_count(); ++i)
       {
-        auto expression= emit_expression(aggregate->arguments()[i]);
+        SqlGenerationResult expression;
+        Item *argument= aggregate->arguments()[i];
+        if ((aggregate->sum_func() == Item_sum::SUM_FUNC ||
+             aggregate->sum_func() == Item_sum::SUM_DISTINCT_FUNC) &&
+            argument && argument->type() == Item::FUNC_ITEM &&
+            static_cast<Item_func *>(argument)->functype() == Item_func::EQUAL_FUNC)
+          expression= emit_null_safe_equality_function(static_cast<Item_func *>(argument), true);
+        else
+          expression= emit_expression(argument);
         if (!expression.supported())
           return expression;
         if (i > 0)
@@ -1549,76 +1663,104 @@ private:
     // Maps MariaDB Item_func::functype enum → translator lambda
     function_transforms = {
       // Comparison operators
-      {Item_func::EQ_FUNC, [](Item_func *f) { return emit_binary_function(f, "="); }},
-      {Item_func::NE_FUNC, [](Item_func *f) { return emit_binary_function(f, "<>"); }},
-      {Item_func::LT_FUNC, [](Item_func *f) { return emit_binary_function(f, "<"); }},
-      {Item_func::LE_FUNC, [](Item_func *f) { return emit_binary_function(f, "<="); }},
-      {Item_func::GE_FUNC, [](Item_func *f) { return emit_binary_function(f, ">="); }},
-      {Item_func::GT_FUNC, [](Item_func *f) { return emit_binary_function(f, ">"); }},
-      
+      {Item_func::EQ_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "="); }},
+      {Item_func::NE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<>"); }},
+      {Item_func::LT_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<"); }},
+      {Item_func::LE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<="); }},
+      {Item_func::GE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, ">="); }},
+      {Item_func::GT_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, ">"); }},
+
       // Null checks
-      {Item_func::ISNULL_FUNC, [](Item_func *f) { return emit_unary_suffix_function(f, "IS NULL"); }},
-      {Item_func::ISNOTNULL_FUNC, [](Item_func *f) { return emit_unary_suffix_function(f, "IS NOT NULL"); }},
-      
+      {Item_func::ISNULL_FUNC, [](Generator &g, Item_func *f) { return g.emit_unary_suffix_function(f, "IS NULL"); }},
+      {Item_func::ISNOTNULL_FUNC, [](Generator &g, Item_func *f) { return g.emit_unary_suffix_function(f, "IS NOT NULL"); }},
+
       // Boolean logic
-      {Item_func::COND_AND_FUNC, [](Item_func *f) { return emit_variadic_infix_function(f, "AND"); }},
-      {Item_func::COND_OR_FUNC, [](Item_func *f) { return emit_variadic_infix_function(f, "OR"); }},
-      {Item_func::NOT_FUNC, [](Item_func *f) { return emit_unary_prefix_function(f, "NOT"); }},
-      
+      {Item_func::COND_AND_FUNC, [](Generator &g, Item_func *f) { return g.emit_variadic_infix_function(f, "AND"); }},
+      {Item_func::COND_OR_FUNC, [](Generator &g, Item_func *f) { return g.emit_variadic_infix_function(f, "OR"); }},
+      {Item_func::NOT_FUNC, [](Generator &g, Item_func *f) { return g.emit_unary_prefix_function(f, "NOT"); }},
+
       // Arithmetic
-      {Item_func::NEG_FUNC, [](Item_func *f) { return emit_unary_prefix_function(f, "-"); }},
-      
+      {Item_func::NEG_FUNC, [](Generator &g, Item_func *f) { return g.emit_unary_prefix_function(f, "-"); }},
+
       // Type casts (common ones)
-      {Item_func::DATE_FUNC, [](Item_func *f) { return emit_unary_cast_function(f, "DATE"); }},
-      {Item_func::CHAR_TYPECAST_FUNC, [](Item_func *f) { return emit_char_typecast_function(static_cast<Item_char_typecast *>(f)); }},
-      {Item_func::YEAR_FUNC, [](Item_func *f) { return emit_extract_function(f, "YEAR"); }},
-      
+      {Item_func::DATE_FUNC, [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "DATE"); }},
+      {Item_func::CHAR_TYPECAST_FUNC, [](Generator &g, Item_func *f) { return g.emit_char_typecast_function(static_cast<Item_char_typecast *>(f)); }},
+      {Item_func::YEAR_FUNC, [](Generator &g, Item_func *f) { return g.emit_extract_function(f, "YEAR"); }},
+
       // CASE expressions
-      {Item_func::CASE_SEARCHED_FUNC, [](Item_func *f) { return emit_searched_case_function(f); }},
-      {Item_func::CASE_SIMPLE_FUNC, [](Item_func *f) { return emit_simple_case_function(f); }},
-      
+      {Item_func::CASE_SEARCHED_FUNC, [](Generator &g, Item_func *f) { return g.emit_searched_case_function(f); }},
+      {Item_func::CASE_SIMPLE_FUNC, [](Generator &g, Item_func *f) { return g.emit_simple_case_function(f); }},
+
       // Pattern matching
-      {Item_func::LIKE_FUNC, [](Item_func *f) { return emit_like_function(static_cast<Item_func_like *>(f)); }},
-      
+      {Item_func::LIKE_FUNC, [](Generator &g, Item_func *f) { return g.emit_like_function(static_cast<Item_func_like *>(f)); }},
+
       // Range/between
-      {Item_func::BETWEEN, [](Item_func *f) { return emit_between_function(f); }},
-      
+      {Item_func::BETWEEN, [](Generator &g, Item_func *f) { return g.emit_between_function(f); }},
+
       // Set membership
-      {Item_func::IN_FUNC, [](Item_func *f) { return emit_in_function(f); }},
-      {Item_func::IN_OPTIMIZER_FUNC, [](Item_func *f) { return emit_in_optimizer_function(f); }},
-      
+      {Item_func::IN_FUNC, [](Generator &g, Item_func *f) { return g.emit_in_function(f); }},
+      {Item_func::IN_OPTIMIZER_FUNC, [](Generator &g, Item_func *f) { return g.emit_in_optimizer_function(f); }},
+
       // EXTRACT function
-      {Item_func::EXTRACT_FUNC, [](Item_func *f) { return emit_extract_function(static_cast<Item_extract *>(f)); }},
-      
-      // NULL-safe equality (not supported)
-      {Item_func::EQUAL_FUNC, [](Item_func *f) { return SqlGenerationResult::unsupported("NULL-safe equality emission is not implemented yet"); }},
+      {Item_func::EXTRACT_FUNC, [](Generator &g, Item_func *f) { return g.emit_extract_function(static_cast<Item_extract *>(f)); }},
+
+      // NULL-safe equality
+      {Item_func::EQUAL_FUNC, [](Generator &g, Item_func *f) { return g.emit_null_safe_equality_function(f, false); }},
     };
     
+    function_name_transforms = {
+      {"date_add_interval", [](Generator &g, Item_func *f) { return g.emit_date_add_interval_function(static_cast<Item_date_add_interval *>(f)); }},
+      {"cast_as_signed", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "DECIMAL(18,0)"); }},
+      {"cast_as_unsigned", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "DECIMAL(20,0)"); }},
+      {"decimal_typecast", [](Generator &g, Item_func *f) { return g.emit_decimal_typecast_function(static_cast<Item_decimal_typecast *>(f)); }},
+      {"float_typecast", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "DOUBLE"); }},
+      {"double_typecast", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "DOUBLE"); }},
+      {"cast_as_time", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "TIME"); }},
+      {"cast_as_datetime", [](Generator &g, Item_func *f) { return g.emit_unary_cast_function(f, "TIMESTAMP"); }},
+      {"ifnull", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "IFNULL"); }},
+      {"coalesce", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "COALESCE"); }},
+      {"concat", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "CONCAT"); }},
+      {"abs", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "ABS"); }},
+      {"lower", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "LOWER"); }},
+      {"lcase", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "LOWER"); }},
+      {"upper", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "UPPER"); }},
+      {"ucase", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "UPPER"); }},
+      {"left", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "LEFT"); }},
+      {"substr", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "SUBSTR"); }},
+      {"substring", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "SUBSTR"); }},
+      {"mod", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "MOD"); }},
+      {"round", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "ROUND"); }},
+      {"+", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "+"); }},
+      {"-", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "-"); }},
+      {"*", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "*"); }},
+      {"/", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "/"); }},
+    };
+
     aggregate_transforms = {
-      {Item_sum::COUNT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::COUNT_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::SUM_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::AVG_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::AVG_DISTINCT_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::MIN_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::MAX_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
-      {Item_sum::STD_FUNC, [](Item_sum *a) { return emit_aggregate(a); }},
+      {Item_sum::COUNT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::COUNT_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::SUM_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::SUM_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::AVG_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::AVG_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::MIN_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::MAX_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
+      {Item_sum::STD_FUNC, [](Generator &g, Item_sum *a) { return g.emit_aggregate(a); }},
     };
     
     window_transforms = {
-      {Item_sum::COUNT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::COUNT_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::SUM_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::SUM_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::AVG_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::AVG_DISTINCT_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::MIN_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::MAX_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::STD_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::ROW_NUMBER_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::RANK_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
-      {Item_sum::DENSE_RANK_FUNC, [](Item_sum *a) { return emit_window_function_call(a); }},
+      {Item_sum::COUNT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::COUNT_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::SUM_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::SUM_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::AVG_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::AVG_DISTINCT_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::MIN_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::MAX_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::STD_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::ROW_NUMBER_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::RANK_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
+      {Item_sum::DENSE_RANK_FUNC, [](Generator &g, Item_sum *a) { return g.emit_window_function_call(a); }},
     };
   }
 };
