@@ -766,7 +766,7 @@ private:
       case ROLLUP_TYPE:
         return SqlGenerationResult::generated("ROLLUP(");
       case CUBE_TYPE:
-        return unsupported("GROUP BY CUBE emission is not implemented yet");
+        return SqlGenerationResult::generated("CUBE(");
       default:
         return unsupported("unknown OLAP grouping type");
     }
@@ -875,6 +875,47 @@ private:
     return emit_aggregate(aggregate);
   }
 
+  Window_spec *find_window_spec_by_name(const LEX_CSTRING &name)
+  {
+    if (!thd || !thd->lex || !thd->lex->current_select || !name.str || !name.length)
+      return nullptr;
+
+    List_iterator_fast<Window_spec> iterator(thd->lex->current_select->window_specs);
+    while (Window_spec *specification= iterator++)
+    {
+      const Lex_ident_window specification_name= specification->name();
+      if (specification_name.str && specification_name.streq(Lex_ident_window(name)))
+        return specification;
+    }
+    return nullptr;
+  }
+
+  Window_spec *resolve_window_spec(Window_spec *specification)
+  {
+    if (!specification)
+      return nullptr;
+    if (specification->referenced_win_spec)
+      return specification;
+    if (specification->window_ref)
+    {
+      Window_spec *referenced= find_window_spec_by_name(*specification->window_ref);
+      if (referenced)
+        specification->referenced_win_spec= referenced;
+    }
+    return specification;
+  }
+
+  Window_spec *resolve_window_spec(Item_window_func *window)
+  {
+    if (!window)
+      return nullptr;
+    if (window->window_spec)
+      return resolve_window_spec(window->window_spec);
+    if (window->window_name)
+      return find_window_spec_by_name(*window->window_name);
+    return nullptr;
+  }
+
   SqlGenerationResult dispatch_window_function(Item_window_func *window)
   {
     if (!window || !window->window_func())
@@ -890,14 +931,15 @@ private:
     }
     if (!result.supported())
       return result;
-    if (window->window_spec)
-    {
-      auto specification = emit_window_spec(window->window_spec);
-      if (!specification.supported())
-        return specification;
-      return SqlGenerationResult::generated(result.sql + " OVER " + specification.sql);
-    }
-    return unsupported("named window references are not implemented yet");
+
+    Window_spec *specification_ref= resolve_window_spec(window);
+    if (!specification_ref)
+      return unsupported("window function has no resolved window specification");
+
+    auto specification= emit_window_spec(specification_ref);
+    if (!specification.supported())
+      return specification;
+    return SqlGenerationResult::generated(result.sql + " OVER " + specification.sql);
   }
 
   SqlGenerationResult dispatch_function(Item_func *function)
@@ -978,6 +1020,21 @@ private:
     }
     sql+= ")";
     return SqlGenerationResult::generated(std::move(sql));
+  }
+
+  SqlGenerationResult emit_nullif_function(Item_func *function)
+  {
+    if (function->argument_count() < 2)
+      return unsupported("NULLIF has too few arguments");
+
+    auto left= emit_expression(function->arguments()[0]);
+    if (!left.supported())
+      return left;
+    auto right= emit_expression(function->arguments()[1]);
+    if (!right.supported())
+      return right;
+
+    return SqlGenerationResult::generated("NULLIF(" + left.sql + ", " + right.sql + ")");
   }
 
   SqlGenerationResult emit_searched_case_function(Item_func *function)
@@ -1730,6 +1787,7 @@ private:
       {"substring", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "SUBSTR"); }},
       {"mod", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "MOD"); }},
       {"round", [](Generator &g, Item_func *f) { return g.emit_named_function(f, "ROUND"); }},
+      {"nullif", [](Generator &g, Item_func *f) { return g.emit_nullif_function(f); }},
       {"+", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "+"); }},
       {"-", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "-"); }},
       {"*", [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "*"); }},
