@@ -1512,23 +1512,6 @@ private:
     return SqlGenerationResult::generated(std::move(sql));
   }
 
-  SqlGenerationResult emit_window_function(Item_window_func *window)
-  {
-    if (!window || !window->window_func())
-      return unsupported("window function has no aggregate function");
-    if (!window->window_spec)
-      return unsupported("named window references are not implemented yet");
-
-    auto function= emit_window_function_call(window->window_func());
-    if (!function.supported())
-      return function;
-    auto specification= emit_window_spec(window->window_spec);
-    if (!specification.supported())
-      return specification;
-
-    return SqlGenerationResult::generated(function.sql + " OVER " + specification.sql);
-  }
-
   SqlGenerationResult emit_window_function_call(Item_sum *function)
   {
     const char *function_name= nullptr;

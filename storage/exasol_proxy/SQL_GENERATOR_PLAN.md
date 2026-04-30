@@ -57,6 +57,44 @@ Direct row/iterator paths must continue to use the storage-engine/core readable 
 The SQL generator is only for higher-level pushdown logic where MariaDB asks the storage engine to
 execute a logical query.
 
+## Non-transformer Path Audit
+
+Current generator structure is intentionally mixed:
+
+- **Transformer-driven expression paths**
+  - scalar `Item_func` dispatch via `function_transforms` and `function_name_transforms`
+  - aggregate `Item_sum` dispatch via `aggregate_transforms`
+  - window-function call dispatch via `window_transforms`
+- **Procedural statement / structural paths**
+  - `SELECT` / compound `SELECT` assembly
+  - projection list iteration
+  - table refs, derived tables, join flattening, right-join normalization, NATURAL/USING joins
+  - `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET`
+  - subquery wrapping and set-operation assembly
+  - window specification / frame / bound rendering
+  - identifier, constant, and alias-reference rendering
+
+This split is **intentional**. The transform tables are the allowlist for scalar/aggregate/window
+expression operators, while statement-shape emission remains procedural because it depends on
+MariaDB-specific tree normalization (`TABLE_LIST`, `next_local`, join representatives, `SELECT_LEX`
+linkage, window-spec inheritance, etc.).
+
+Audit conclusion:
+
+- there is **no remaining broad SQL-printer fallback** for unsupported AST nodes
+- scalar/operator coverage should continue to grow through the transform tables
+- structural paths should stay procedural unless a concrete repetition or fail-open risk appears
+- stale duplicate helper paths are undesirable because they can preserve obsolete unsupported
+  messages after the main dispatch path has moved on
+
+Concrete follow-up from this audit:
+
+- removed the obsolete unused `emit_window_function(Item_window_func *)` helper, which still had
+  the old `named window references are not implemented yet` failure path after named-window support
+  moved into `dispatch_window_function()`
+- keep future work focused on real gaps such as `GROUPING()` rather than mechanically migrating
+  join / `SELECT` assembly into transform tables
+
 ## Semantic Decisions
 
 - `ORDER BY` NULL ordering: generated EXASOL SQL intentionally follows Exasol defaults
