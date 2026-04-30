@@ -766,6 +766,12 @@ private:
       case ROLLUP_TYPE:
         return SqlGenerationResult::generated("ROLLUP(");
       case CUBE_TYPE:
+        /*
+          Generator-side CUBE emission is implemented here, but MariaDB core on
+          this branch rejects raw WITH CUBE syntax before the EXASOL proxy
+          generator is reached. Per project scope, we intentionally do not patch
+          core parser behavior outside storage/exasol_proxy.
+        */
         return SqlGenerationResult::generated("CUBE(");
       default:
         return unsupported("unknown OLAP grouping type");

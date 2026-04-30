@@ -110,6 +110,11 @@ Concrete follow-up from this audit:
   as a supported AST shape. TPC-DS q51/q97-style cases are covered by explicit
   matched-rows plus anti-semi `UNION ALL` rewrites that use generator-supported set operation,
   comma join, and `NOT EXISTS` nodes.
-- `GROUPING()`: raw function syntax is not handled by the generator. TPC-DS q27/q36/q70/q86-style
-  cases are covered by explicit `WITH ROLLUP` plus `CASE ... IS NULL` marker rewrites for compact
-  fixtures whose hierarchy keys are non-null.
+- `CUBE`: generator-side emission exists (`CUBE(...)`), but runnable SQL-harness validation is
+  intentionally skipped in this project because MariaDB core rejects raw `WITH CUBE` syntax before
+  the EXASOL proxy generator is reached. Per project scope, we do not patch MariaDB core parser
+  behavior outside `storage/exasol_proxy`.
+- `GROUPING()`: raw function syntax is intentionally skipped in this project because MariaDB core on
+  this branch does not expose runnable `GROUPING()` support to the EXASOL proxy path. TPC-DS
+  q27/q36/q70/q86-style cases should continue to use rewrite-based fixtures such as `WITH ROLLUP`
+  plus `CASE ... IS NULL` markers for compact hierarchies whose grouping keys are non-null.
