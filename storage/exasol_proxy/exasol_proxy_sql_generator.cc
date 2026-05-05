@@ -1290,6 +1290,37 @@ private:
     }
   }
 
+  bool is_empty_string_constant(Item *item)
+  {
+    if (!item)
+      return false;
+    const Item_const *constant= item->get_item_const();
+    if (!constant || constant->const_is_null())
+      return false;
+    if (const String *value= constant->const_ptr_string())
+      return value->length() == 0;
+    return false;
+  }
+
+  SqlGenerationResult emit_empty_string_comparison_function(Item_func *function, bool negated)
+  {
+    if (function->argument_count() != 2)
+      return unsupported("empty-string comparison has unexpected argument count");
+
+    Item *left_arg= function->arguments()[0];
+    Item *right_arg= function->arguments()[1];
+    if (!is_empty_string_constant(left_arg) && !is_empty_string_constant(right_arg))
+      return unsupported("comparison does not use an empty string constant");
+
+    Item *expression_arg= is_empty_string_constant(left_arg) ? right_arg : left_arg;
+    auto expression= emit_expression(expression_arg);
+    if (!expression.supported())
+      return expression;
+
+    return SqlGenerationResult::generated("(LENGTH(" + expression.sql + ") " +
+                                          (negated ? "> 0" : "= 0") + ")");
+  }
+
   SqlGenerationResult emit_binary_function(Item_func *function, const char *operator_text)
   {
     if (function->argument_count() != 2)
@@ -1709,8 +1740,20 @@ private:
     // Maps MariaDB Item_func::functype enum → translator lambda
     function_transforms = {
       // Comparison operators
-      {Item_func::EQ_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "="); }},
-      {Item_func::NE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<>"); }},
+      {Item_func::EQ_FUNC,
+       [](Generator &g, Item_func *f) {
+         return g.is_empty_string_constant(f->arguments()[0]) ||
+                    g.is_empty_string_constant(f->arguments()[1])
+                ? g.emit_empty_string_comparison_function(f, false)
+                : g.emit_binary_function(f, "=");
+       }},
+      {Item_func::NE_FUNC,
+       [](Generator &g, Item_func *f) {
+         return g.is_empty_string_constant(f->arguments()[0]) ||
+                    g.is_empty_string_constant(f->arguments()[1])
+                ? g.emit_empty_string_comparison_function(f, true)
+                : g.emit_binary_function(f, "<>");
+       }},
       {Item_func::LT_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<"); }},
       {Item_func::LE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, "<="); }},
       {Item_func::GE_FUNC, [](Generator &g, Item_func *f) { return g.emit_binary_function(f, ">="); }},
