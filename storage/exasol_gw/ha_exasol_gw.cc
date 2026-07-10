@@ -72,7 +72,7 @@ public:
 
   ulonglong table_flags() const override
   {
-    return HA_BINLOG_STMT_CAPABLE | HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY;
+    return HA_BINLOG_STMT_CAPABLE | HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY | HA_NO_TRANSACTIONS;
   }
 
   ulong index_flags(uint, uint, bool) const override { return 0; }
@@ -220,6 +220,13 @@ public:
 
   int external_lock(THD *, int) override { return 0; }
 
+  enum_alter_inplace_result check_if_supported_inplace_alter(TABLE *, Alter_inplace_info *) override
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
+             "ALTER TABLE is not supported for EXASOL SessionGW tables");
+    return HA_ALTER_ERROR;
+  }
+
   THR_LOCK_DATA **store_lock(THD *, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override
   {
@@ -311,7 +318,7 @@ std::string exasol_type_for_field(Field *field)
   case MYSQL_TYPE_LONG:
     return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(10,0)" : "DECIMAL(18,0)";
   case MYSQL_TYPE_LONGLONG:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(20,0)" : "DECIMAL(36,0)";
+    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(18,0)" : "DECIMAL(18,0)";
   case MYSQL_TYPE_YEAR:
     return "DECIMAL(4,0)";
   case MYSQL_TYPE_FLOAT:
@@ -336,7 +343,7 @@ std::string exasol_type_for_field(Field *field)
     return "BOOLEAN";
   default:
   {
-    const uint length= std::max<uint>(1, field->field_length);
+    const uint length= std::max<uint>(1, field->char_length());
     if (field->type() == MYSQL_TYPE_STRING)
       return "CHAR(" + std::to_string(length) + ") UTF8";
     return "VARCHAR(" + std::to_string(length) + ") UTF8";
@@ -389,6 +396,83 @@ void append_fixed_value(std::vector<std::uint8_t> &out, const void *value, std::
   out.insert(out.end(), bytes, bytes + size);
 }
 
+struct ExasolNativeTimestamp
+{
+  std::uint32_t nanosecond;
+  std::uint32_t seconds_since_midnight;
+  std::uint32_t date;
+  std::uint32_t padding;
+};
+
+std::uint32_t native_date_value(const std::uint32_t year,
+                                const std::uint32_t month,
+                                const std::uint32_t day)
+{
+  return (year << 16U) | (month << 8U) | day;
+}
+
+std::uint32_t parse_native_date(Field *field)
+{
+  const longlong value= field->val_int();
+  const std::uint32_t day= static_cast<std::uint32_t>(value % 100);
+  const std::uint32_t month= static_cast<std::uint32_t>((value / 100) % 100);
+  const std::uint32_t year= static_cast<std::uint32_t>(value / 10000);
+  return native_date_value(year, month, day);
+}
+
+ExasolNativeTimestamp parse_native_timestamp(Field *field)
+{
+  const longlong value= field->val_int();
+  const std::uint32_t second= static_cast<std::uint32_t>(value % 100);
+  const std::uint32_t minute= static_cast<std::uint32_t>((value / 100) % 100);
+  const std::uint32_t hour= static_cast<std::uint32_t>((value / 10000) % 100);
+  const std::uint32_t day= static_cast<std::uint32_t>((value / 1000000) % 100);
+  const std::uint32_t month= static_cast<std::uint32_t>((value / 100000000) % 100);
+  const std::uint32_t year= static_cast<std::uint32_t>(value / 10000000000LL);
+  return {0U, hour * 3600U + minute * 60U + second, native_date_value(year, month, day), 0U};
+}
+
+__int128_t parse_scaled_decimal(Field *field)
+{
+  StringBuffer<128> value_buffer;
+  String *value= field->val_str(&value_buffer);
+  if (!value)
+    return 0;
+  const uint scale= field->decimals();
+  __int128_t scaled= 0;
+  bool negative= false;
+  uint fractional_digits= 0;
+  bool fractional= false;
+  const char *ptr= value->ptr();
+  const char *end= ptr + value->length();
+  if (ptr != end && *ptr == '-')
+  {
+    negative= true;
+    ++ptr;
+  }
+  for (; ptr != end; ++ptr)
+  {
+    if (*ptr == '.')
+    {
+      fractional= true;
+      continue;
+    }
+    if (*ptr < '0' || *ptr > '9')
+      continue;
+    if (fractional && fractional_digits >= scale)
+      continue;
+    scaled= scaled * 10 + static_cast<int>(*ptr - '0');
+    if (fractional)
+      ++fractional_digits;
+  }
+  while (fractional_digits < scale)
+  {
+    scaled *= 10;
+    ++fractional_digits;
+  }
+  return negative ? -scaled : scaled;
+}
+
 exasol_gw::SessionGwRowHandle row_handle_from_ref(const uchar *ref)
 {
   exasol_gw::SessionGwRowHandle row_handle;
@@ -424,6 +508,43 @@ bool append_field_to_native_batch(exasol_gw::NativeWriteBatchBuilder &builder, F
   case MYSQL_TYPE_DOUBLE:
   {
     const double value= field->is_null() ? 0.0 : field->val_real();
+    std::vector<std::uint8_t> fixed;
+    append_fixed_value(fixed, &value, sizeof(value));
+    builder.append_fixed_column(nulls, fixed);
+    return true;
+  }
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL:
+  {
+    const __int128_t scaled= field->is_null() ? 0 : parse_scaled_decimal(field);
+    std::vector<std::uint8_t> fixed;
+    if (field->field_length <= 18)
+    {
+      const std::int64_t value= static_cast<std::int64_t>(scaled);
+      append_fixed_value(fixed, &value, sizeof(value));
+    }
+    else
+    {
+      append_fixed_value(fixed, &scaled, sizeof(scaled));
+    }
+    builder.append_fixed_column(nulls, fixed);
+    return true;
+  }
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  {
+    const std::uint32_t value= field->is_null() ? 0U : parse_native_date(field);
+    std::vector<std::uint8_t> fixed;
+    append_fixed_value(fixed, &value, sizeof(value));
+    builder.append_fixed_column(nulls, fixed);
+    return true;
+  }
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+  {
+    const ExasolNativeTimestamp value= field->is_null() ? ExasolNativeTimestamp{0U, 0U, 0U, 0U} : parse_native_timestamp(field);
     std::vector<std::uint8_t> fixed;
     append_fixed_value(fixed, &value, sizeof(value));
     builder.append_fixed_column(nulls, fixed);

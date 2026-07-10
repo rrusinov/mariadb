@@ -31,6 +31,25 @@ void copy_error(char *buffer, unsigned long buffer_size, const std::string &mess
   buffer[size]= '\0';
 }
 
+std::string apply_decimal_scale(const std::string &integer_value, uint scale)
+{
+  if (scale == 0 || integer_value.empty())
+    return integer_value;
+  bool negative= integer_value[0] == '-';
+  std::string digits= negative ? integer_value.substr(1) : integer_value;
+  while (digits.size() <= scale)
+    digits.insert(digits.begin(), '0');
+  digits.insert(digits.end() - static_cast<std::ptrdiff_t>(scale), '.');
+  return negative ? "-" + digits : digits;
+}
+
+std::string cell_value_for_field(Field *field, const exasol_gw::ArrowCell &cell)
+{
+  if (field->type() == MYSQL_TYPE_DECIMAL || field->type() == MYSQL_TYPE_NEWDECIMAL)
+    return apply_decimal_scale(cell.value, field->decimals());
+  return cell.value;
+}
+
 void set_query_from_generated_sql(String *query,
                                   std::string *query_generation_error,
                                   const exasol_gw::SqlGenerationResult &generated)
@@ -236,7 +255,8 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
       else
       {
         (*field)->set_notnull();
-        (*field)->store(cell.value.data(), cell.value.size(), &my_charset_bin);
+        const std::string value= cell_value_for_field(*field, cell);
+        (*field)->store(value.data(), value.size(), &my_charset_bin);
       }
     }
     if (current_row < current_row_handles.size())

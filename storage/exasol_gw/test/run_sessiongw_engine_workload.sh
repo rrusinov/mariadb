@@ -3,8 +3,9 @@ set -euo pipefail
 
 # Live SessionGW-backed MariaDB ENGINE=EXASOL workload.
 # This intentionally mirrors the old rr.examariadb prototype's core coverage:
-# plugin load, DDL lifecycle, scan/pushdown, insert/update/delete, multi-session
-# stress, and direct Exasol final-state verification.
+# plugin load, DDL lifecycle, scan/pushdown, insert/update/delete, type conversion,
+# LOAD DATA, prepared statements, multi-session stress, a configurable performance
+# baseline, and direct Exasol final-state verification.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MARIADB_SRC=${MARIADB_SRC:-$(cd "$SCRIPT_DIR/../../.." && pwd -P)}
@@ -16,6 +17,8 @@ EXASOL_PORT=${EXASOL_PORT:-8571}
 SCHEMA=${SCHEMA:-SGW_MDB_COV}
 READ_CLIENTS=${READ_CLIENTS:-16}
 INSERT_CLIENTS=${INSERT_CLIENTS:-20}
+PERF_ROWS=${PERF_ROWS:-1000}
+PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-100}
 
 require_file() {
     if [[ ! -e "$1" ]]; then
@@ -59,7 +62,34 @@ sql_exasol() {
 }
 
 mysql() {
-    "$MARIADB_BUILD/client/mariadb" --no-defaults --socket="$SOCKET" "$@"
+    "$MARIADB_BUILD/client/mariadb" --no-defaults --local-infile=1 --socket="$SOCKET" "$@"
+}
+
+mysql_scalar() {
+    mysql --batch --raw --skip-column-names -e "$1" | tail -n 1
+}
+
+expect_scalar() {
+    local label=$1
+    local sql=$2
+    local expected=$3
+    local actual
+    actual=$(mysql_scalar "$sql")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Unexpected $label: expected '$expected' got '$actual'" >&2
+        exit 1
+    fi
+    log "PASS $label = $actual"
+}
+
+expect_failure() {
+    local label=$1
+    local sql=$2
+    if mysql -e "$sql" >"$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out" 2>&1; then
+        echo "Expected failure for $label but command succeeded" >&2
+        exit 1
+    fi
+    log "PASS expected failure: $label"
 }
 
 log "SessionGW MariaDB engine workload"
@@ -91,7 +121,7 @@ EXASOL_SESSIONGW_TLS=skip_verify \
     --port=0 --skip-networking \
     --plugin-dir="$MARIADB_BUILD/storage/exasol_gw" \
     --plugin-load-add=ha_exasol_gw.so \
-    --log-error="$MDB/mariadb.err" --skip-grant-tables --user="$(id -un)" \
+    --log-error="$MDB/mariadb.err" --skip-grant-tables --local-infile=1 --user="$(id -un)" \
     >"$MDB/stdout.log" 2>&1 &
 
 for _ in $(seq 1 60); do
@@ -118,6 +148,99 @@ SELECT * FROM T ORDER BY ID;
 SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
 SQL
 log "PASS ddl insert update delete scan"
+
+expect_scalar "prepared statement count" \
+    "USE $SCHEMA; PREPARE s FROM 'SELECT COUNT(*) FROM T WHERE ID > ?'; SET @p=1; EXECUTE s USING @p; DEALLOCATE PREPARE s;" \
+    "2"
+
+expect_failure "unsupported key definition" \
+    "USE $SCHEMA; CREATE TABLE BAD_KEY(ID INT, KEY(ID)) ENGINE=EXASOL"
+expect_failure "unsupported alter table" \
+    "USE $SCHEMA; ALTER TABLE T ADD COLUMN EXTRA INT"
+
+mysql --table <<SQL | tee -a "$REPORT"
+USE $SCHEMA;
+CREATE TABLE TYPES(
+  ID INT,
+  B BIT,
+  TI TINYINT,
+  SI SMALLINT,
+  MI MEDIUMINT,
+  I INT,
+  BI BIGINT,
+  D DECIMAL(12,2),
+  F FLOAT,
+  DBL DOUBLE,
+  DT DATE,
+  TS TIMESTAMP NULL,
+  C CHAR(3),
+  V VARCHAR(80)
+) ENGINE=EXASOL;
+INSERT INTO TYPES VALUES
+  (1, b'1', -12, -1234, -123456, -1234567, -12345678901, 1234.56, 1.25, 2.5,
+   '2026-07-10', '2026-07-10 11:12:13', 'abc', 'unicode äöü'),
+  (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+SELECT COUNT(*) AS C FROM TYPES;
+SELECT ID, B, TI, SI, MI, I, BI, D, ROUND(DBL,1) AS RDBL, DT, TS, C, V FROM TYPES ORDER BY ID;
+DELETE FROM TYPES WHERE ID=2;
+SELECT ID, D, DT, TS, V FROM TYPES ORDER BY ID;
+CREATE TABLE TYPE_UPD(ID INT, D DECIMAL(12,2), DT DATE, TS TIMESTAMP NULL, V VARCHAR(80)) ENGINE=EXASOL;
+INSERT INTO TYPE_UPD VALUES (1, 1.25, '2026-07-10', '2026-07-10 11:12:13', 'before');
+UPDATE TYPE_UPD SET D=42.42, DT='2026-07-11', TS='2026-07-11 01:02:03', V='updated' WHERE ID=1;
+SELECT ID, D, DT, TS, V FROM TYPE_UPD ORDER BY ID;
+SQL
+expect_scalar "type matrix final count" "USE $SCHEMA; SELECT COUNT(*) FROM TYPES" "1"
+TYPE_UPD_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT ID FROM TYPE_UPD; SELECT D FROM TYPE_UPD; SELECT DT FROM TYPE_UPD; SELECT TS FROM TYPE_UPD; SELECT V FROM TYPE_UPD;" | paste -sd'|' -)
+if [[ "$TYPE_UPD_FINAL" != "1|42.42|2026-07-11|2026-07-11 01:02:03|updated" ]]; then
+    echo "Unexpected type update final state: $TYPE_UPD_FINAL" >&2
+    exit 1
+fi
+log "PASS type update final $TYPE_UPD_FINAL"
+log "PASS supported type matrix"
+
+LOAD_FILE=$BASE_DIR/load_data.csv
+printf '20,LoadA\n21,LoadB\n22,LoadC\n' > "$LOAD_FILE"
+mysql --table <<SQL | tee -a "$REPORT"
+USE $SCHEMA;
+CREATE TABLE LOAD_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;
+LOAD DATA LOCAL INFILE '$LOAD_FILE' INTO TABLE LOAD_T FIELDS TERMINATED BY ',';
+SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM LOAD_T;
+SQL
+expect_scalar "load data count" "USE $SCHEMA; SELECT COUNT(*) FROM LOAD_T" "3"
+log "PASS load data"
+
+PERF_SQL=$BASE_DIR/perf.sql
+{
+    echo "USE $SCHEMA;"
+    echo "CREATE TABLE PERF_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;"
+    for start in $(seq 1 "$PERF_INSERT_BATCH_ROWS" "$PERF_ROWS"); do
+        end=$((start + PERF_INSERT_BATCH_ROWS - 1))
+        if (( end > PERF_ROWS )); then end=$PERF_ROWS; fi
+        printf 'INSERT INTO PERF_T VALUES '
+        first=1
+        for id in $(seq "$start" "$end"); do
+            if (( first )); then first=0; else printf ','; fi
+            printf '(%s, '\''Perf_%s'\'')' "$id" "$id"
+        done
+        printf ';\n'
+    done
+    echo "SELECT COUNT(*) AS C, SUM(ID) AS S FROM PERF_T;"
+    echo "UPDATE PERF_T SET NAME='Perf_updated' WHERE ID <= 10;"
+    echo "DELETE FROM PERF_T WHERE ID > $((PERF_ROWS - 5));"
+    echo "SELECT COUNT(*) AS C, SUM(ID) AS S, COUNT(CASE WHEN NAME='Perf_updated' THEN 1 END) AS U FROM PERF_T;"
+} > "$PERF_SQL"
+perf_start=$(date +%s)
+mysql --table < "$PERF_SQL" | tee -a "$REPORT"
+perf_end=$(date +%s)
+expected_perf_count=$((PERF_ROWS - 5))
+expected_perf_sum=$((PERF_ROWS * (PERF_ROWS + 1) / 2 - ((PERF_ROWS - 4 + PERF_ROWS) * 5 / 2)))
+PERF_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM PERF_T; SELECT SUM(ID) FROM PERF_T; SELECT COUNT(*) FROM PERF_T WHERE NAME='Perf_updated';" | paste -sd'|' -)
+EXPECTED_PERF="$expected_perf_count|$expected_perf_sum|10"
+if [[ "$PERF_FINAL" != "$EXPECTED_PERF" ]]; then
+    echo "Unexpected performance baseline final state: expected $EXPECTED_PERF got $PERF_FINAL" >&2
+    exit 1
+fi
+log "PASS performance baseline rows=$PERF_ROWS insert_batch=$PERF_INSERT_BATCH_ROWS seconds=$((perf_end - perf_start)) final=$PERF_FINAL"
 
 # Concurrent reads.
 read_pids=()
