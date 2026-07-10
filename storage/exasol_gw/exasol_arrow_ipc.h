@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 
 enum class ArrowColumnKind
@@ -34,6 +34,6 @@ struct ArrowRowBatch
 ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_message,
                                         const std::vector<ArrowColumnKind> &columns);
 
-} // namespace exasol_proxy
+} // namespace exasol_gw
 
 #endif

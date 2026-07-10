@@ -8,7 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 namespace
 {
@@ -377,4 +377,4 @@ ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_mes
   return batch;
 }
 
-} // namespace exasol_proxy
+} // namespace exasol_gw

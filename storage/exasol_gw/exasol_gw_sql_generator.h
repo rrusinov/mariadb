@@ -1,5 +1,5 @@
-#ifndef EXASOL_PROXY_SQL_GENERATOR_INCLUDED
-#define EXASOL_PROXY_SQL_GENERATOR_INCLUDED
+#ifndef EXASOL_GW_SQL_GENERATOR_INCLUDED
+#define EXASOL_GW_SQL_GENERATOR_INCLUDED
 
 #include <string>
 #include <utility>
@@ -15,7 +15,7 @@ class Item_sum;
 class Item_window_func;
 class Item_subselect;
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 
 struct SqlGenerationResult
@@ -49,6 +49,6 @@ SqlGenerationResult generate_exasol_sql(THD *thd, st_select_lex_unit *lex_unit);
 SqlGenerationResult generate_exasol_sql(THD *thd, st_select_lex *sel_lex);
 SqlGenerationResult generate_exasol_order_sql(THD *thd, st_order *order);
 
-} // namespace exasol_proxy
+} // namespace exasol_gw
 
 #endif

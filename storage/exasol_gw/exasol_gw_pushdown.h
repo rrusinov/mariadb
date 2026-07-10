@@ -1,5 +1,5 @@
-#ifndef HA_EXASOL_PROXY_PUSHDOWN_INCLUDED
-#define HA_EXASOL_PROXY_PUSHDOWN_INCLUDED
+#ifndef HA_EXASOL_GW_PUSHDOWN_INCLUDED
+#define HA_EXASOL_GW_PUSHDOWN_INCLUDED
 
 #include "derived_handler.h"
 #include "sql_string.h"
@@ -12,13 +12,13 @@
 #include <string>
 #include <vector>
 
-class ha_exasol_proxy;
+class ha_exasol_gw;
 
-class ha_exasol_proxy_cursor
+class ha_exasol_gw_cursor
 {
 public:
-  ha_exasol_proxy_cursor();
-  ~ha_exasol_proxy_cursor();
+  ha_exasol_gw_cursor();
+  ~ha_exasol_gw_cursor();
 
   int open_pushed_query(TABLE *table_arg, const char *query_text, char *error_buffer,
                         unsigned long error_buffer_size);
@@ -33,19 +33,19 @@ private:
                               unsigned long error_buffer_size);
   void initialize_column_kinds(TABLE *table_arg);
 
-  exasol_proxy::SessionGwOptions options;
-  exasol_proxy::SessionGwConnection connection;
+  exasol_gw::SessionGwOptions options;
+  exasol_gw::SessionGwConnection connection;
   std::uint64_t cursor_id;
-  exasol_proxy::ArrowRowBatch current_batch;
+  exasol_gw::ArrowRowBatch current_batch;
   std::size_t current_row;
   bool end_of_cursor;
-  std::vector<exasol_proxy::ArrowColumnKind> column_kinds;
+  std::vector<exasol_gw::ArrowColumnKind> column_kinds;
 };
 
-class ha_exasol_proxy_pushdown_handler_base
+class ha_exasol_gw_pushdown_handler_base
 {
 protected:
-  explicit ha_exasol_proxy_pushdown_handler_base(TABLE *tbl_arg)
+  explicit ha_exasol_gw_pushdown_handler_base(TABLE *tbl_arg)
     : query_table(tbl_arg), cursor(nullptr)
   {
   }
@@ -58,16 +58,16 @@ protected:
   int end_scan_();
 
   TABLE *query_table;
-  ha_exasol_proxy_cursor *cursor;
+  ha_exasol_gw_cursor *cursor;
   std::string query_generation_error;
 };
 
-class ha_exasol_proxy_derived_handler: public derived_handler,
-                                       public ha_exasol_proxy_pushdown_handler_base
+class ha_exasol_gw_derived_handler: public derived_handler,
+                                       public ha_exasol_gw_pushdown_handler_base
 {
 public:
-  ha_exasol_proxy_derived_handler(THD *thd_arg, TABLE_LIST *derived_arg, TABLE *tbl_arg);
-  ~ha_exasol_proxy_derived_handler() override;
+  ha_exasol_gw_derived_handler(THD *thd_arg, TABLE_LIST *derived_arg, TABLE *tbl_arg);
+  ~ha_exasol_gw_derived_handler() override;
 
   int init_scan() override { return init_scan_(thd, table, query.ptr(), false); }
   int next_row() override { return next_row_(table); }
@@ -77,14 +77,14 @@ private:
   StringBuffer<512> query;
 };
 
-class ha_exasol_proxy_select_handler: public select_handler,
-                                      public ha_exasol_proxy_pushdown_handler_base
+class ha_exasol_gw_select_handler: public select_handler,
+                                      public ha_exasol_gw_pushdown_handler_base
 {
 public:
-  ha_exasol_proxy_select_handler(THD *thd_arg, SELECT_LEX_UNIT *sel_unit, TABLE *tbl);
-  ha_exasol_proxy_select_handler(THD *thd_arg, SELECT_LEX *sel_lex,
+  ha_exasol_gw_select_handler(THD *thd_arg, SELECT_LEX_UNIT *sel_unit, TABLE *tbl);
+  ha_exasol_gw_select_handler(THD *thd_arg, SELECT_LEX *sel_lex,
                                  SELECT_LEX_UNIT *sel_unit, TABLE *tbl);
-  ~ha_exasol_proxy_select_handler() override;
+  ~ha_exasol_gw_select_handler() override;
 
   int init_scan() override;
   int next_row() override;

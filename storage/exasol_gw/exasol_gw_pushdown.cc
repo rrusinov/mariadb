@@ -8,8 +8,8 @@
 #include "sql_class.h"
 #include "sql_lex.h"
 
-#include "exasol_proxy_pushdown.h"
-#include "exasol_proxy_sql_generator.h"
+#include "exasol_gw_pushdown.h"
+#include "exasol_gw_sql_generator.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,7 +17,7 @@
 #include <memory>
 #include <sstream>
 
-extern handlerton *exasol_proxy_hton;
+extern handlerton *exasol_gw_hton;
 
 namespace
 {
@@ -33,7 +33,7 @@ void copy_error(char *buffer, unsigned long buffer_size, const std::string &mess
 
 void set_query_from_generated_sql(String *query,
                                   std::string *query_generation_error,
-                                  const exasol_proxy::SqlGenerationResult &generated)
+                                  const exasol_gw::SqlGenerationResult &generated)
 {
   if (!generated.supported())
   {
@@ -79,10 +79,10 @@ std::string field_name(Field *field)
   return std::string(field->field_name.str, field->field_name.length);
 }
 
-exasol_proxy::ArrowColumnKind kind_for_field(Field *field)
+exasol_gw::ArrowColumnKind kind_for_field(Field *field)
 {
   if (!field)
-    return exasol_proxy::ArrowColumnKind::utf8;
+    return exasol_gw::ArrowColumnKind::utf8;
   switch (field->type())
   {
   case MYSQL_TYPE_TINY:
@@ -91,45 +91,45 @@ exasol_proxy::ArrowColumnKind kind_for_field(Field *field)
   case MYSQL_TYPE_LONGLONG:
   case MYSQL_TYPE_INT24:
   case MYSQL_TYPE_YEAR:
-    return exasol_proxy::ArrowColumnKind::signed_int64;
+    return exasol_gw::ArrowColumnKind::signed_int64;
   case MYSQL_TYPE_FLOAT:
   case MYSQL_TYPE_DOUBLE:
-    return exasol_proxy::ArrowColumnKind::float64;
+    return exasol_gw::ArrowColumnKind::float64;
   case MYSQL_TYPE_DATE:
   case MYSQL_TYPE_NEWDATE:
-    return exasol_proxy::ArrowColumnKind::date32;
+    return exasol_gw::ArrowColumnKind::date32;
   case MYSQL_TYPE_DATETIME:
   case MYSQL_TYPE_DATETIME2:
   case MYSQL_TYPE_TIMESTAMP:
   case MYSQL_TYPE_TIMESTAMP2:
-    return exasol_proxy::ArrowColumnKind::timestamp_ns;
+    return exasol_gw::ArrowColumnKind::timestamp_ns;
   case MYSQL_TYPE_BIT:
-    return exasol_proxy::ArrowColumnKind::boolean;
+    return exasol_gw::ArrowColumnKind::boolean;
   case MYSQL_TYPE_DECIMAL:
   case MYSQL_TYPE_NEWDECIMAL:
-    return exasol_proxy::ArrowColumnKind::decimal128_as_integer_string;
+    return exasol_gw::ArrowColumnKind::decimal128_as_integer_string;
   default:
-    return exasol_proxy::ArrowColumnKind::utf8;
+    return exasol_gw::ArrowColumnKind::utf8;
   }
 }
 
 } // namespace
 
-ha_exasol_proxy_cursor::ha_exasol_proxy_cursor()
-  : options(exasol_proxy::options_from_environment()),
+ha_exasol_gw_cursor::ha_exasol_gw_cursor()
+  : options(exasol_gw::options_from_environment()),
     cursor_id(0),
     current_row(0),
     end_of_cursor(false)
 {
 }
 
-ha_exasol_proxy_cursor::~ha_exasol_proxy_cursor()
+ha_exasol_gw_cursor::~ha_exasol_gw_cursor()
 {
   char ignored[1]= {0};
   (void) close(ignored, sizeof(ignored));
 }
 
-void ha_exasol_proxy_cursor::initialize_column_kinds(TABLE *table_arg)
+void ha_exasol_gw_cursor::initialize_column_kinds(TABLE *table_arg)
 {
   column_kinds.clear();
   if (!table_arg)
@@ -138,7 +138,7 @@ void ha_exasol_proxy_cursor::initialize_column_kinds(TABLE *table_arg)
     column_kinds.push_back(kind_for_field(*field));
 }
 
-int ha_exasol_proxy_cursor::open_pushed_query(TABLE *table_arg,
+int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
                                               const char *query_text,
                                               char *error_buffer,
                                               unsigned long error_buffer_size)
@@ -147,10 +147,10 @@ int ha_exasol_proxy_cursor::open_pushed_query(TABLE *table_arg,
   {
     initialize_column_kinds(table_arg);
     connection.connect_and_enter(options);
-    exasol_proxy::SessionGwOpenCursorResult opened=
+    exasol_gw::SessionGwOpenCursorResult opened=
         connection.open_pushed_query(query_text ? std::string(query_text) : std::string());
     cursor_id= opened.cursor_id;
-    current_batch= exasol_proxy::ArrowRowBatch();
+    current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
     end_of_cursor= false;
     return 0;
@@ -162,7 +162,7 @@ int ha_exasol_proxy_cursor::open_pushed_query(TABLE *table_arg,
   }
 }
 
-int ha_exasol_proxy_cursor::open_table_scan(TABLE *table_arg,
+int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
                                             char *error_buffer,
                                             unsigned long error_buffer_size)
 {
@@ -173,10 +173,10 @@ int ha_exasol_proxy_cursor::open_table_scan(TABLE *table_arg,
     for (Field **field= table_arg->field; *field; ++field)
       columns.push_back(field_name(*field));
     connection.connect_and_enter(options);
-    exasol_proxy::SessionGwOpenCursorResult opened=
+    exasol_gw::SessionGwOpenCursorResult opened=
         connection.open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns);
     cursor_id= opened.cursor_id;
-    current_batch= exasol_proxy::ArrowRowBatch();
+    current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
     end_of_cursor= false;
     return 0;
@@ -188,15 +188,15 @@ int ha_exasol_proxy_cursor::open_table_scan(TABLE *table_arg,
   }
 }
 
-int ha_exasol_proxy_cursor::fetch_next_batch(char *error_buffer, unsigned long error_buffer_size)
+int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long error_buffer_size)
 {
   try
   {
     while (!end_of_cursor)
     {
-      exasol_proxy::SessionGwFetchResult fetched= connection.fetch(cursor_id, options.fetch_rows, 0);
+      exasol_gw::SessionGwFetchResult fetched= connection.fetch(cursor_id, options.fetch_rows, 0);
       end_of_cursor= fetched.end_of_cursor;
-      current_batch= exasol_proxy::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
+      current_batch= exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
       current_row= 0;
       if (current_batch.rows > 0)
         return 0;
@@ -212,7 +212,7 @@ int ha_exasol_proxy_cursor::fetch_next_batch(char *error_buffer, unsigned long e
   }
 }
 
-int ha_exasol_proxy_cursor::materialize_current_row(TABLE *table_arg,
+int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
                                                     unsigned char *,
                                                     char *error_buffer,
                                                     unsigned long error_buffer_size)
@@ -226,7 +226,7 @@ int ha_exasol_proxy_cursor::materialize_current_row(TABLE *table_arg,
     {
       if (column >= current_batch.columns.size())
         throw std::runtime_error("SessionGW Arrow column count does not match MariaDB table");
-      const exasol_proxy::ArrowCell &cell= current_batch.columns[column][current_row];
+      const exasol_gw::ArrowCell &cell= current_batch.columns[column][current_row];
       if (cell.is_null)
       {
         (*field)->set_null();
@@ -247,7 +247,7 @@ int ha_exasol_proxy_cursor::materialize_current_row(TABLE *table_arg,
   }
 }
 
-int ha_exasol_proxy_cursor::fetch_row(TABLE *table_arg,
+int ha_exasol_gw_cursor::fetch_row(TABLE *table_arg,
                                       unsigned char *record,
                                       char *error_buffer,
                                       unsigned long error_buffer_size)
@@ -261,7 +261,7 @@ int ha_exasol_proxy_cursor::fetch_row(TABLE *table_arg,
   return materialize_current_row(table_arg, record, error_buffer, error_buffer_size);
 }
 
-int ha_exasol_proxy_cursor::close(char *error_buffer, unsigned long error_buffer_size)
+int ha_exasol_gw_cursor::close(char *error_buffer, unsigned long error_buffer_size)
 {
   try
   {
@@ -281,7 +281,7 @@ int ha_exasol_proxy_cursor::close(char *error_buffer, unsigned long error_buffer
   }
 }
 
-int ha_exasol_proxy_pushdown_handler_base::init_scan_(THD *,
+int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *,
                                                       TABLE *table_arg,
                                                       const char *query_text,
                                                       bool)
@@ -293,7 +293,7 @@ int ha_exasol_proxy_pushdown_handler_base::init_scan_(THD *,
     return HA_ERR_INTERNAL_ERROR;
   }
 
-  cursor= new ha_exasol_proxy_cursor();
+  cursor= new ha_exasol_gw_cursor();
   char error_buffer[512]= {0};
   const int rc= cursor->open_pushed_query(table_arg, query_text, error_buffer, sizeof(error_buffer));
   if (rc != 0)
@@ -306,7 +306,7 @@ int ha_exasol_proxy_pushdown_handler_base::init_scan_(THD *,
   return rc;
 }
 
-int ha_exasol_proxy_pushdown_handler_base::next_row_(TABLE *table_arg)
+int ha_exasol_gw_pushdown_handler_base::next_row_(TABLE *table_arg)
 {
   if (!cursor)
     return HA_ERR_END_OF_FILE;
@@ -321,7 +321,7 @@ int ha_exasol_proxy_pushdown_handler_base::next_row_(TABLE *table_arg)
   return rc;
 }
 
-int ha_exasol_proxy_pushdown_handler_base::end_scan_()
+int ha_exasol_gw_pushdown_handler_base::end_scan_()
 {
   if (!cursor)
     return 0;
@@ -338,25 +338,25 @@ int ha_exasol_proxy_pushdown_handler_base::end_scan_()
   return 0;
 }
 
-ha_exasol_proxy_derived_handler::ha_exasol_proxy_derived_handler(THD *thd_arg,
+ha_exasol_gw_derived_handler::ha_exasol_gw_derived_handler(THD *thd_arg,
                                                                  TABLE_LIST *derived_arg,
                                                                  TABLE *tbl_arg)
-  : derived_handler(thd_arg, exasol_proxy_hton),
-    ha_exasol_proxy_pushdown_handler_base(tbl_arg),
+  : derived_handler(thd_arg, exasol_gw_hton),
+    ha_exasol_gw_pushdown_handler_base(tbl_arg),
     query(thd_arg->charset())
 {
   derived= derived_arg;
   query.length(0);
-  auto generated= exasol_proxy::generate_exasol_sql(thd_arg, derived_arg->derived);
+  auto generated= exasol_gw::generate_exasol_sql(thd_arg, derived_arg->derived);
   set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
-ha_exasol_proxy_derived_handler::~ha_exasol_proxy_derived_handler()= default;
+ha_exasol_gw_derived_handler::~ha_exasol_gw_derived_handler()= default;
 
-ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
+ha_exasol_gw_select_handler::ha_exasol_gw_select_handler(
     THD *thd_arg, SELECT_LEX_UNIT *lex_unit, TABLE *tbl)
-  : select_handler(thd_arg, exasol_proxy_hton, lex_unit),
-    ha_exasol_proxy_pushdown_handler_base(tbl),
+  : select_handler(thd_arg, exasol_gw_hton, lex_unit),
+    ha_exasol_gw_pushdown_handler_base(tbl),
     query(thd_arg->charset()),
     stage_query(thd_arg->charset()),
     staged_order_by(thd_arg->charset()),
@@ -365,14 +365,14 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   query.length(0);
   stage_query.length(0);
   staged_order_by.length(0);
-  auto generated= exasol_proxy::generate_exasol_sql(thd_arg, lex_unit);
+  auto generated= exasol_gw::generate_exasol_sql(thd_arg, lex_unit);
   set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
-ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
+ha_exasol_gw_select_handler::ha_exasol_gw_select_handler(
     THD *thd_arg, SELECT_LEX *sel_lex, SELECT_LEX_UNIT *lex_unit, TABLE *tbl)
-  : select_handler(thd_arg, exasol_proxy_hton, sel_lex, lex_unit),
-    ha_exasol_proxy_pushdown_handler_base(tbl),
+  : select_handler(thd_arg, exasol_gw_hton, sel_lex, lex_unit),
+    ha_exasol_gw_pushdown_handler_base(tbl),
     query(thd_arg->charset()),
     stage_query(thd_arg->charset()),
     staged_order_by(thd_arg->charset()),
@@ -385,26 +385,26 @@ ha_exasol_proxy_select_handler::ha_exasol_proxy_select_handler(
   uses_staged_distinct_pushdown= should_use_staged_distinct_pushdown(sel_lex);
   if (uses_staged_distinct_pushdown)
   {
-    auto generated= exasol_proxy::generate_exasol_sql(thd_arg, sel_lex->master_unit());
+    auto generated= exasol_gw::generate_exasol_sql(thd_arg, sel_lex->master_unit());
     set_query_from_generated_sql(&stage_query, &query_generation_error, generated);
 
-    auto order_by= exasol_proxy::generate_exasol_order_sql(thd_arg, sel_lex->order_list.first);
+    auto order_by= exasol_gw::generate_exasol_order_sql(thd_arg, sel_lex->order_list.first);
     set_query_from_generated_sql(&staged_order_by, &query_generation_error, order_by);
     return;
   }
 
   auto generated= get_pushdown_type() == select_pushdown_type::SINGLE_SELECT ?
-      exasol_proxy::generate_exasol_sql(thd_arg, sel_lex->master_unit()) :
-      exasol_proxy::generate_exasol_sql(thd_arg, sel_lex);
+      exasol_gw::generate_exasol_sql(thd_arg, sel_lex->master_unit()) :
+      exasol_gw::generate_exasol_sql(thd_arg, sel_lex);
   set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
-ha_exasol_proxy_select_handler::~ha_exasol_proxy_select_handler()
+ha_exasol_gw_select_handler::~ha_exasol_gw_select_handler()
 {
   (void) end_scan_();
 }
 
-int ha_exasol_proxy_select_handler::init_scan()
+int ha_exasol_gw_select_handler::init_scan()
 {
   if (uses_staged_distinct_pushdown)
   {
@@ -422,12 +422,12 @@ int ha_exasol_proxy_select_handler::init_scan()
   return init_scan_(thd, table, query.ptr(), false);
 }
 
-int ha_exasol_proxy_select_handler::next_row()
+int ha_exasol_gw_select_handler::next_row()
 {
   return next_row_(table);
 }
 
-int ha_exasol_proxy_select_handler::end_scan()
+int ha_exasol_gw_select_handler::end_scan()
 {
   return end_scan_();
 }

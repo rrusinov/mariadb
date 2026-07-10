@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 
 enum class SessionGwMessageType: std::uint16_t
@@ -20,12 +20,24 @@ enum class SessionGwMessageType: std::uint16_t
   close= 5,
   ok= 6,
   error= 7,
+  describe_table= 8,
+  describe_table_result= 9,
+  get_table_version= 10,
+  get_table_version_result= 11,
   open_pushed_query= 12,
   open_cursor_result= 13,
   fetch= 14,
   fetch_result= 15,
   close_cursor= 16,
-  open_table_scan= 17
+  open_table_scan= 17,
+  open_table_insert= 18,
+  open_table_operation_result= 19,
+  insert_rows= 20,
+  affected_rows_result= 21,
+  close_operation= 22,
+  set_autocommit= 23,
+  commit= 24,
+  rollback= 25
 };
 
 struct SessionGwFrame
@@ -65,10 +77,27 @@ struct SessionGwFetchResult
   std::vector<std::uint8_t> arrow_batch;
 };
 
+struct SessionGwDescribeTableResult
+{
+  std::string schema_name;
+  std::string table_name;
+  std::string table_version;
+  std::vector<std::uint8_t> arrow_schema;
+};
+
+struct SessionGwOpenOperationResult
+{
+  std::uint64_t operation_id= 0;
+  std::vector<std::uint8_t> accepted_schema;
+};
+
 void append_u8(std::vector<std::uint8_t> &out, std::uint8_t value);
+void append_u16(std::vector<std::uint8_t> &out, std::uint16_t value);
 void append_u32(std::vector<std::uint8_t> &out, std::uint32_t value);
 void append_u64(std::vector<std::uint8_t> &out, std::uint64_t value);
+void append_string16(std::vector<std::uint8_t> &out, const std::string &value);
 void append_string32(std::vector<std::uint8_t> &out, const std::string &value);
+void append_bytes32(std::vector<std::uint8_t> &out, const std::vector<std::uint8_t> &bytes);
 std::uint8_t read_u8(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
 std::uint16_t read_u16(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
 std::uint32_t read_u32(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
@@ -90,10 +119,25 @@ public:
   void connect_and_enter(const SessionGwOptions &options);
   void close();
 
+  SessionGwDescribeTableResult describe_table(const std::string &schema,
+                                              const std::string &table);
+  std::string get_table_version(const std::string &schema, const std::string &table);
   SessionGwOpenCursorResult open_pushed_query(const std::string &sql);
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns);
+  SessionGwOpenOperationResult open_table_insert(const std::string &schema,
+                                                 const std::string &table,
+                                                 const std::vector<std::string> &columns,
+                                                 std::uint32_t max_rows_per_batch,
+                                                 const std::vector<std::uint8_t> &arrow_schema);
+  std::uint64_t insert_rows(std::uint64_t operation_id,
+                            std::uint32_t row_count,
+                            const std::vector<std::uint8_t> &native_batch);
+  void close_operation(std::uint64_t operation_id);
+  void set_autocommit(bool enabled);
+  void commit();
+  void rollback();
   SessionGwFetchResult fetch(std::uint64_t cursor_id,
                              std::uint32_t max_rows,
                              std::uint32_t max_bytes= 0);
@@ -104,6 +148,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace exasol_proxy
+} // namespace exasol_gw
 
 #endif

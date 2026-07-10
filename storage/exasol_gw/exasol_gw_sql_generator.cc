@@ -2,7 +2,7 @@
 #define MYSQL_SERVER 1
 #endif
 
-#include "exasol_proxy_sql_generator.h"
+#include "exasol_gw_sql_generator.h"
 
 #include <my_global.h>
 
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 namespace
 {
@@ -770,7 +770,7 @@ private:
           Generator-side CUBE emission is implemented here, but MariaDB core on
           this branch rejects raw WITH CUBE syntax before the EXASOL proxy
           generator is reached. Per project scope, we intentionally do not patch
-          core parser behavior outside storage/exasol_proxy.
+          core parser behavior outside storage/exasol_gw.
         */
         return SqlGenerationResult::generated("CUBE(");
       default:
@@ -1872,4 +1872,4 @@ SqlGenerationResult generate_exasol_order_sql(THD *thd, st_order *order)
   return Generator(thd).generate_order_sql(order);
 }
 
-} // namespace exasol_proxy
+} // namespace exasol_gw

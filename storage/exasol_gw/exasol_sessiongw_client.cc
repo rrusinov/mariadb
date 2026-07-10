@@ -21,7 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace exasol_proxy
+namespace exasol_gw
 {
 namespace
 {
@@ -366,6 +366,11 @@ void append_u8(std::vector<std::uint8_t> &out, std::uint8_t value)
   out.push_back(value);
 }
 
+void append_u16(std::vector<std::uint8_t> &out, std::uint16_t value)
+{
+  append_big_endian(out, value, 2);
+}
+
 void append_u32(std::vector<std::uint8_t> &out, std::uint32_t value)
 {
   append_big_endian(out, value, 4);
@@ -376,10 +381,24 @@ void append_u64(std::vector<std::uint8_t> &out, std::uint64_t value)
   append_big_endian(out, value, 8);
 }
 
+void append_string16(std::vector<std::uint8_t> &out, const std::string &value)
+{
+  if (value.size() > std::numeric_limits<std::uint16_t>::max())
+    throw SessionGwError("SessionGW string16 value too large");
+  append_u16(out, static_cast<std::uint16_t>(value.size()));
+  out.insert(out.end(), value.begin(), value.end());
+}
+
 void append_string32(std::vector<std::uint8_t> &out, const std::string &value)
 {
   append_u32(out, static_cast<std::uint32_t>(value.size()));
   out.insert(out.end(), value.begin(), value.end());
+}
+
+void append_bytes32(std::vector<std::uint8_t> &out, const std::vector<std::uint8_t> &bytes)
+{
+  append_u32(out, static_cast<std::uint32_t>(bytes.size()));
+  out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
 std::uint8_t read_u8(const std::vector<std::uint8_t> &bytes, std::size_t &offset)
@@ -496,6 +515,37 @@ public:
     }
   }
 
+  SessionGwDescribeTableResult describe_table(const std::string &schema, const std::string &table)
+  {
+    std::vector<std::uint8_t> payload;
+    append_string16(payload, schema);
+    append_string16(payload, table);
+    SessionGwFrame frame= request(SessionGwMessageType::describe_table,
+                                  payload,
+                                  SessionGwMessageType::describe_table_result);
+    std::size_t offset= 0;
+    SessionGwDescribeTableResult result;
+    result.schema_name= read_string16(frame.payload, offset);
+    result.table_name= read_string16(frame.payload, offset);
+    result.table_version= read_string16(frame.payload, offset);
+    result.arrow_schema= read_bytes32(frame.payload, offset);
+    return result;
+  }
+
+  std::string get_table_version(const std::string &schema, const std::string &table)
+  {
+    std::vector<std::uint8_t> payload;
+    append_string16(payload, schema);
+    append_string16(payload, table);
+    SessionGwFrame frame= request(SessionGwMessageType::get_table_version,
+                                  payload,
+                                  SessionGwMessageType::get_table_version_result);
+    std::size_t offset= 0;
+    (void) read_string16(frame.payload, offset);
+    (void) read_string16(frame.payload, offset);
+    return read_string16(frame.payload, offset);
+  }
+
   SessionGwOpenCursorResult open_pushed_query(const std::string &sql)
   {
     std::vector<std::uint8_t> payload;
@@ -521,6 +571,67 @@ public:
                                   payload,
                                   SessionGwMessageType::open_cursor_result);
     return parse_open_cursor(frame);
+  }
+
+  SessionGwOpenOperationResult open_table_insert(const std::string &schema,
+                                                 const std::string &table,
+                                                 const std::vector<std::string> &columns,
+                                                 std::uint32_t max_rows_per_batch,
+                                                 const std::vector<std::uint8_t> &arrow_schema)
+  {
+    std::vector<std::uint8_t> payload;
+    append_string32(payload, schema);
+    append_string32(payload, table);
+    append_u32(payload, static_cast<std::uint32_t>(columns.size()));
+    for (const std::string &column: columns)
+      append_string32(payload, column);
+    append_u32(payload, max_rows_per_batch);
+    append_bytes32(payload, arrow_schema);
+    SessionGwFrame frame= request(SessionGwMessageType::open_table_insert,
+                                  payload,
+                                  SessionGwMessageType::open_table_operation_result);
+    return parse_open_operation(frame);
+  }
+
+  std::uint64_t insert_rows(std::uint64_t operation_id,
+                            std::uint32_t row_count,
+                            const std::vector<std::uint8_t> &native_batch)
+  {
+    std::vector<std::uint8_t> payload;
+    (void) row_count;
+    append_u64(payload, operation_id);
+    append_u32(payload, static_cast<std::uint32_t>(native_batch.size()));
+    const std::size_t aligned_size= (payload.size() + alignof(std::max_align_t) - 1U) & ~(alignof(std::max_align_t) - 1U);
+    payload.resize(aligned_size, 0U);
+    payload.insert(payload.end(), native_batch.begin(), native_batch.end());
+    SessionGwFrame frame= request(SessionGwMessageType::insert_rows,
+                                  payload,
+                                  SessionGwMessageType::affected_rows_result);
+    return parse_affected_rows(frame);
+  }
+
+  void close_operation(std::uint64_t operation_id)
+  {
+    std::vector<std::uint8_t> payload;
+    append_u64(payload, operation_id);
+    (void) request(SessionGwMessageType::close_operation, payload, SessionGwMessageType::ok);
+  }
+
+  void set_autocommit(bool enabled)
+  {
+    std::vector<std::uint8_t> payload;
+    append_u8(payload, enabled ? 1 : 0);
+    (void) request(SessionGwMessageType::set_autocommit, payload, SessionGwMessageType::ok);
+  }
+
+  void commit()
+  {
+    (void) request(SessionGwMessageType::commit, {}, SessionGwMessageType::ok);
+  }
+
+  void rollback()
+  {
+    (void) request(SessionGwMessageType::rollback, {}, SessionGwMessageType::ok);
   }
 
   SessionGwFetchResult fetch(std::uint64_t cursor_id, std::uint32_t max_rows, std::uint32_t max_bytes)
@@ -658,7 +769,7 @@ private:
     std::ostringstream login;
     login << "{\"username\":\"" << json_escape(options_.user)
           << "\",\"password\":\"" << encrypted_password
-          << "\",\"useCompression\":false,\"clientName\":\"mariadb_exasol_proxy_sessiongw\"}";
+          << "\",\"useCompression\":false,\"clientName\":\"mariadb_exasol_gw_sessiongw\"}";
     send_text(login.str());
     require_status_ok(receive_text());
   }
@@ -711,6 +822,23 @@ private:
     if (result.cursor_id == 0)
       throw SessionGwError("invalid SessionGW cursor id");
     return result;
+  }
+
+  SessionGwOpenOperationResult parse_open_operation(const SessionGwFrame &frame)
+  {
+    std::size_t offset= 0;
+    SessionGwOpenOperationResult result;
+    result.operation_id= read_u64(frame.payload, offset);
+    result.accepted_schema= read_bytes32(frame.payload, offset);
+    if (result.operation_id == 0)
+      throw SessionGwError("invalid SessionGW operation id");
+    return result;
+  }
+
+  std::uint64_t parse_affected_rows(const SessionGwFrame &frame)
+  {
+    std::size_t offset= 0;
+    return read_u64(frame.payload, offset);
   }
 
   void send_websocket_frame(std::uint8_t first_byte, const std::uint8_t *payload, std::size_t size)
@@ -786,6 +914,18 @@ void SessionGwConnection::close()
   impl_->close();
 }
 
+SessionGwDescribeTableResult SessionGwConnection::describe_table(const std::string &schema,
+                                                                  const std::string &table)
+{
+  return impl_->describe_table(schema, table);
+}
+
+std::string SessionGwConnection::get_table_version(const std::string &schema,
+                                                   const std::string &table)
+{
+  return impl_->get_table_version(schema, table);
+}
+
 SessionGwOpenCursorResult SessionGwConnection::open_pushed_query(const std::string &sql)
 {
   return impl_->open_pushed_query(sql);
@@ -810,4 +950,41 @@ void SessionGwConnection::close_cursor(std::uint64_t cursor_id)
   impl_->close_cursor(cursor_id);
 }
 
-} // namespace exasol_proxy
+SessionGwOpenOperationResult SessionGwConnection::open_table_insert(
+    const std::string &schema,
+    const std::string &table,
+    const std::vector<std::string> &columns,
+    std::uint32_t max_rows_per_batch,
+    const std::vector<std::uint8_t> &arrow_schema)
+{
+  return impl_->open_table_insert(schema, table, columns, max_rows_per_batch, arrow_schema);
+}
+
+std::uint64_t SessionGwConnection::insert_rows(std::uint64_t operation_id,
+                                               std::uint32_t row_count,
+                                               const std::vector<std::uint8_t> &native_batch)
+{
+  return impl_->insert_rows(operation_id, row_count, native_batch);
+}
+
+void SessionGwConnection::close_operation(std::uint64_t operation_id)
+{
+  impl_->close_operation(operation_id);
+}
+
+void SessionGwConnection::set_autocommit(bool enabled)
+{
+  impl_->set_autocommit(enabled);
+}
+
+void SessionGwConnection::commit()
+{
+  impl_->commit();
+}
+
+void SessionGwConnection::rollback()
+{
+  impl_->rollback();
+}
+
+} // namespace exasol_gw
