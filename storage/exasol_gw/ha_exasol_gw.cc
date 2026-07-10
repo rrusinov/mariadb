@@ -12,11 +12,14 @@
 #include "exasol_gw_pushdown.h"
 #include "exasol_native_write_batch.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static select_handler *create_exasol_gw_select_handler(THD *thd,
@@ -31,6 +34,7 @@ handlerton *exasol_gw_hton= nullptr;
 
 namespace
 {
+struct InsertContext;
 std::string create_table_sql(TABLE *form);
 std::string drop_table_sql_from_path(const char *from);
 }
@@ -58,15 +62,12 @@ class ha_exasol_gw: public handler
 {
 public:
   ha_exasol_gw(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg), share(nullptr), cursor(nullptr)
+    : handler(hton, table_arg), share(nullptr), cursor(nullptr), insert_context(nullptr)
   {
     ref_length= sizeof(std::uint32_t) + sizeof(std::uint64_t);
   }
 
-  ~ha_exasol_gw() override
-  {
-    delete cursor;
-  }
+  ~ha_exasol_gw() override;
 
   const char *index_type(uint) override { return "NONE"; }
 
@@ -150,6 +151,8 @@ public:
     }
   }
 
+  void start_bulk_insert(ha_rows rows, uint flags) override;
+  int end_bulk_insert() override;
   int write_row(const uchar *) override;
   int update_row(const uchar *, const uchar *) override;
   int delete_row(const uchar *) override;
@@ -218,7 +221,7 @@ public:
     return 0;
   }
 
-  int external_lock(THD *, int) override { return 0; }
+  int external_lock(THD *, int lock_type) override;
 
   enum_alter_inplace_result check_if_supported_inplace_alter(TABLE *, Alter_inplace_info *) override
   {
@@ -257,9 +260,12 @@ private:
     return share;
   }
 
+  int close_insert_context();
+
   THR_LOCK_DATA lock;
   Exasol_gw_share *share;
   ha_exasol_gw_cursor *cursor;
+  InsertContext *insert_context;
 };
 
 namespace
@@ -486,9 +492,45 @@ exasol_gw::SessionGwRowHandle row_handle_from_ref(const uchar *ref)
   return row_handle;
 }
 
-bool append_field_to_native_batch(exasol_gw::NativeWriteBatchBuilder &builder, Field *field)
+bool native_field_is_variable(Field *field)
 {
-  std::vector<std::uint8_t> nulls(1, field->is_null() ? exasol_gw::native_write_null : exasol_gw::native_write_not_null);
+  switch (field->type())
+  {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONGLONG:
+  case MYSQL_TYPE_YEAR:
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL:
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+  case MYSQL_TYPE_BIT:
+    return false;
+  default:
+    return true;
+  }
+}
+
+struct NativeColumnBuffer
+{
+  bool variable= false;
+  std::vector<std::uint8_t> nulls;
+  std::vector<std::uint8_t> fixed;
+  std::vector<std::size_t> sizes;
+  std::vector<std::uint8_t> variable_data;
+};
+
+bool append_field_to_column_buffer(NativeColumnBuffer &column, Field *field)
+{
+  column.nulls.push_back(field->is_null() ? exasol_gw::native_write_null : exasol_gw::native_write_not_null);
   switch (field->type())
   {
   case MYSQL_TYPE_TINY:
@@ -499,44 +541,36 @@ bool append_field_to_native_batch(exasol_gw::NativeWriteBatchBuilder &builder, F
   case MYSQL_TYPE_YEAR:
   {
     const std::int64_t value= field->is_null() ? 0 : static_cast<std::int64_t>(field->val_int());
-    std::vector<std::uint8_t> fixed;
-    append_fixed_value(fixed, &value, sizeof(value));
-    builder.append_fixed_column(nulls, fixed);
+    append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }
   case MYSQL_TYPE_FLOAT:
   case MYSQL_TYPE_DOUBLE:
   {
     const double value= field->is_null() ? 0.0 : field->val_real();
-    std::vector<std::uint8_t> fixed;
-    append_fixed_value(fixed, &value, sizeof(value));
-    builder.append_fixed_column(nulls, fixed);
+    append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }
   case MYSQL_TYPE_DECIMAL:
   case MYSQL_TYPE_NEWDECIMAL:
   {
     const __int128_t scaled= field->is_null() ? 0 : parse_scaled_decimal(field);
-    std::vector<std::uint8_t> fixed;
     if (field->field_length <= 18)
     {
       const std::int64_t value= static_cast<std::int64_t>(scaled);
-      append_fixed_value(fixed, &value, sizeof(value));
+      append_fixed_value(column.fixed, &value, sizeof(value));
     }
     else
     {
-      append_fixed_value(fixed, &scaled, sizeof(scaled));
+      append_fixed_value(column.fixed, &scaled, sizeof(scaled));
     }
-    builder.append_fixed_column(nulls, fixed);
     return true;
   }
   case MYSQL_TYPE_DATE:
   case MYSQL_TYPE_NEWDATE:
   {
     const std::uint32_t value= field->is_null() ? 0U : parse_native_date(field);
-    std::vector<std::uint8_t> fixed;
-    append_fixed_value(fixed, &value, sizeof(value));
-    builder.append_fixed_column(nulls, fixed);
+    append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }
   case MYSQL_TYPE_DATETIME:
@@ -545,54 +579,70 @@ bool append_field_to_native_batch(exasol_gw::NativeWriteBatchBuilder &builder, F
   case MYSQL_TYPE_TIMESTAMP2:
   {
     const ExasolNativeTimestamp value= field->is_null() ? ExasolNativeTimestamp{0U, 0U, 0U, 0U} : parse_native_timestamp(field);
-    std::vector<std::uint8_t> fixed;
-    append_fixed_value(fixed, &value, sizeof(value));
-    builder.append_fixed_column(nulls, fixed);
+    append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }
   case MYSQL_TYPE_BIT:
   {
     const std::uint8_t value= field->is_null() ? 0 : static_cast<std::uint8_t>(field->val_int() ? 0xffU : 0x00U);
-    std::vector<std::uint8_t> fixed;
-    append_fixed_value(fixed, &value, sizeof(value));
-    builder.append_fixed_column(nulls, fixed);
+    append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }
   default:
   {
     StringBuffer<512> value_buffer;
-    std::vector<std::size_t> sizes(1, 0);
-    std::vector<std::uint8_t> variable;
     if (!field->is_null())
     {
       String *value= field->val_str(&value_buffer);
       if (!value)
         return false;
-      sizes[0]= value->length();
-      variable.insert(variable.end(),
-                      reinterpret_cast<const std::uint8_t *>(value->ptr()),
-                      reinterpret_cast<const std::uint8_t *>(value->ptr()) + value->length());
+      column.sizes.push_back(value->length());
+      column.variable_data.insert(column.variable_data.end(),
+                                  reinterpret_cast<const std::uint8_t *>(value->ptr()),
+                                  reinterpret_cast<const std::uint8_t *>(value->ptr()) + value->length());
     }
-    builder.append_variable_column(nulls, sizes, variable);
+    else
+    {
+      column.sizes.push_back(0);
+    }
     return true;
   }
   }
+}
+
+bool build_native_batch_from_columns(const std::vector<NativeColumnBuffer> &columns,
+                                     std::uint32_t row_count,
+                                     std::vector<std::uint8_t> *batch)
+{
+  batch->clear();
+  exasol_gw::NativeWriteBatchBuilder builder(*batch);
+  builder.begin(row_count, static_cast<std::uint32_t>(columns.size()));
+  for (const NativeColumnBuffer &column: columns)
+  {
+    if (column.variable)
+      builder.append_variable_column(column.nulls, column.sizes, column.variable_data);
+    else
+      builder.append_fixed_column(column.nulls, column.fixed);
+  }
+  builder.finish();
+  return true;
 }
 
 bool build_one_row_native_batch(TABLE *table,
                                 const std::vector<std::string> &columns,
                                 std::vector<std::uint8_t> *batch)
 {
-  batch->clear();
-  exasol_gw::NativeWriteBatchBuilder builder(*batch);
-  builder.begin(1, static_cast<std::uint32_t>(columns.size()));
+  (void) columns;
+  std::vector<NativeColumnBuffer> buffered_columns;
   for (Field **field= table->field; *field; ++field)
   {
-    if (!append_field_to_native_batch(builder, *field))
+    NativeColumnBuffer column;
+    column.variable= native_field_is_variable(*field);
+    if (!append_field_to_column_buffer(column, *field))
       return false;
+    buffered_columns.push_back(std::move(column));
   }
-  builder.finish();
-  return true;
+  return build_native_batch_from_columns(buffered_columns, 1, batch);
 }
 
 std::vector<std::string> table_column_names(TABLE *table)
@@ -603,53 +653,192 @@ std::vector<std::string> table_column_names(TABLE *table)
   return columns;
 }
 
-} // namespace
-
-int ha_exasol_gw::write_row(const uchar *)
+std::uint32_t insert_batch_rows_from_environment()
 {
-  constexpr int max_attempts= 8;
-  std::string last_error;
-  for (int attempt= 0; attempt < max_attempts; ++attempt)
+  const char *value= std::getenv("EXASOL_SESSIONGW_INSERT_BATCH_ROWS");
+  if (!value || !*value)
+    return 10000;
+  const unsigned long parsed= std::strtoul(value, nullptr, 10);
+  if (parsed == 0)
+    return 10000;
+  return static_cast<std::uint32_t>(std::min<unsigned long>(parsed, 1000000UL));
+}
+
+bool is_transaction_collision(const std::string &message)
+{
+  return message.find("Transaction collision") != std::string::npos ||
+         message.find("GlobalTransactionRollback") != std::string::npos;
+}
+
+struct InsertContext
+{
+  explicit InsertContext(std::uint32_t max_rows): max_rows_per_batch(max_rows) {}
+
+  int append(TABLE *table)
   {
     try
     {
-      exasol_gw::SessionGwOptions options= exasol_gw::options_from_environment();
-      exasol_gw::SessionGwConnection connection;
-      connection.connect_and_enter(options);
-
-      const std::string schema= table_schema_name(table);
-      const std::string object= table_object_name(table);
-      exasol_gw::SessionGwDescribeTableResult described= connection.describe_table(schema, object);
-
-      std::vector<std::string> columns= table_column_names(table);
-
-      exasol_gw::SessionGwOpenOperationResult opened=
-          connection.open_table_insert(schema, object, columns, 1, described.arrow_schema);
-
-      std::vector<std::uint8_t> batch;
-      if (!build_one_row_native_batch(table, columns, &batch))
-        return HA_ERR_UNSUPPORTED;
-
-      const std::uint64_t affected= connection.insert_rows(opened.operation_id, 1, batch);
-      connection.close_operation(opened.operation_id);
-      connection.close();
-      return affected == 1 ? 0 : HA_ERR_INTERNAL_ERROR;
+      ensure_open(table);
+      if (pending_columns.empty())
+      {
+        for (Field **field= table->field; *field; ++field)
+        {
+          NativeColumnBuffer column;
+          column.variable= native_field_is_variable(*field);
+          pending_columns.push_back(std::move(column));
+        }
+      }
+      std::size_t column_index= 0;
+      for (Field **field= table->field; *field; ++field, ++column_index)
+      {
+        if (!append_field_to_column_buffer(pending_columns[column_index], *field))
+          return HA_ERR_UNSUPPORTED;
+      }
+      ++pending_rows;
+      if (pending_rows >= max_rows_per_batch)
+        return flush(table);
+      return 0;
     }
     catch (const std::exception &ex)
     {
-      last_error= ex.what();
-      if (last_error.find("Transaction collision") == std::string::npos &&
-          last_error.find("GlobalTransactionRollback") == std::string::npos)
-      {
-        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, last_error.c_str());
-        return HA_ERR_INTERNAL_ERROR;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(25 * (attempt + 1)));
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
+      return HA_ERR_INTERNAL_ERROR;
     }
   }
-  my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
-           last_error.empty() ? "EXASOL SessionGW insert failed" : last_error.c_str());
-  return HA_ERR_INTERNAL_ERROR;
+
+  int close(TABLE *table)
+  {
+    try
+    {
+      int rc= flush(table);
+      connection.close();
+      connected= false;
+      return rc;
+    }
+    catch (const std::exception &ex)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
+      return HA_ERR_INTERNAL_ERROR;
+    }
+  }
+
+  void ensure_open(TABLE *table)
+  {
+    if (connected)
+      return;
+    options= exasol_gw::options_from_environment();
+    connection.connect_and_enter(options);
+    connected= true;
+    schema= table_schema_name(table);
+    object= table_object_name(table);
+    columns= table_column_names(table);
+    described= connection.describe_table(schema, object);
+  }
+
+  int flush(TABLE *table)
+  {
+    if (pending_rows == 0)
+      return 0;
+    std::vector<std::uint8_t> batch;
+    if (!build_native_batch_from_columns(pending_columns, pending_rows, &batch))
+      return HA_ERR_UNSUPPORTED;
+
+    constexpr int max_attempts= 8;
+    std::string last_error;
+    for (int attempt= 0; attempt < max_attempts; ++attempt)
+    {
+      try
+      {
+        ensure_open(table);
+        const exasol_gw::SessionGwOpenOperationResult opened=
+            connection.open_table_insert(schema, object, columns, max_rows_per_batch, described.arrow_schema);
+        const std::uint64_t affected= connection.insert_rows(opened.operation_id, pending_rows, batch);
+        connection.close_operation(opened.operation_id);
+        if (affected != pending_rows)
+          return HA_ERR_INTERNAL_ERROR;
+        reset_pending();
+        return 0;
+      }
+      catch (const std::exception &ex)
+      {
+        last_error= ex.what();
+        connection.close();
+        connected= false;
+        if (!is_transaction_collision(last_error))
+        {
+          my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, last_error.c_str());
+          return HA_ERR_INTERNAL_ERROR;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25 * (attempt + 1)));
+      }
+    }
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+             last_error.empty() ? "EXASOL SessionGW batched insert failed" : last_error.c_str());
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  void reset_pending()
+  {
+    pending_columns.clear();
+    pending_rows= 0;
+  }
+
+  exasol_gw::SessionGwOptions options;
+  exasol_gw::SessionGwConnection connection;
+  bool connected= false;
+  std::string schema;
+  std::string object;
+  std::vector<std::string> columns;
+  exasol_gw::SessionGwDescribeTableResult described;
+  std::uint32_t max_rows_per_batch= 10000;
+  std::uint32_t pending_rows= 0;
+  std::vector<NativeColumnBuffer> pending_columns;
+};
+
+} // namespace
+
+ha_exasol_gw::~ha_exasol_gw()
+{
+  (void) close_insert_context();
+  delete cursor;
+}
+
+void ha_exasol_gw::start_bulk_insert(ha_rows, uint)
+{
+  if (!insert_context)
+    insert_context= new InsertContext(insert_batch_rows_from_environment());
+}
+
+int ha_exasol_gw::end_bulk_insert()
+{
+  return close_insert_context();
+}
+
+int ha_exasol_gw::external_lock(THD *, int lock_type)
+{
+  if (lock_type == F_UNLCK)
+    return close_insert_context();
+  return 0;
+}
+
+int ha_exasol_gw::close_insert_context()
+{
+  if (!insert_context)
+    return 0;
+  InsertContext *context= insert_context;
+  insert_context= nullptr;
+  const int rc= context->close(table);
+  delete context;
+  return rc;
+}
+
+int ha_exasol_gw::write_row(const uchar *)
+{
+  if (!insert_context)
+    insert_context= new InsertContext(insert_batch_rows_from_environment());
+  if (!insert_context)
+    return HA_ERR_OUT_OF_MEM;
+  return insert_context->append(table);
 }
 
 int ha_exasol_gw::update_row(const uchar *, const uchar *new_data)

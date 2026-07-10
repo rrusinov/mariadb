@@ -17,8 +17,8 @@ EXASOL_PORT=${EXASOL_PORT:-8571}
 SCHEMA=${SCHEMA:-SGW_MDB_COV}
 READ_CLIENTS=${READ_CLIENTS:-16}
 INSERT_CLIENTS=${INSERT_CLIENTS:-20}
-PERF_ROWS=${PERF_ROWS:-1000}
-PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-100}
+PERF_ROWS=${PERF_ROWS:-100000}
+PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
 
 require_file() {
     if [[ ! -e "$1" ]]; then
@@ -96,6 +96,9 @@ log "SessionGW MariaDB engine workload"
 log "base=$BASE_DIR"
 log "mariadb_build=$MARIADB_BUILD"
 log "nano_port=$EXASOL_PORT"
+log "perf_rows=$PERF_ROWS"
+log "perf_insert_batch_rows=$PERF_INSERT_BATCH_ROWS"
+log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
 
 "$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
 APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
