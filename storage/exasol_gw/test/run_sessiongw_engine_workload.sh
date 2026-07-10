@@ -19,6 +19,10 @@ READ_CLIENTS=${READ_CLIENTS:-16}
 INSERT_CLIENTS=${INSERT_CLIENTS:-20}
 PERF_ROWS=${PERF_ROWS:-100000}
 PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
+PERF_UPDATE_ROWS=${PERF_UPDATE_ROWS:-$((PERF_ROWS / 10))}
+PERF_DELETE_ROWS=${PERF_DELETE_ROWS:-$((PERF_ROWS / 20))}
+if (( PERF_UPDATE_ROWS == 0 )); then PERF_UPDATE_ROWS=1; fi
+if (( PERF_DELETE_ROWS == 0 )); then PERF_DELETE_ROWS=1; fi
 
 require_file() {
     if [[ ! -e "$1" ]]; then
@@ -98,7 +102,11 @@ log "mariadb_build=$MARIADB_BUILD"
 log "nano_port=$EXASOL_PORT"
 log "perf_rows=$PERF_ROWS"
 log "perf_insert_batch_rows=$PERF_INSERT_BATCH_ROWS"
+log "perf_update_rows=$PERF_UPDATE_ROWS"
+log "perf_delete_rows=$PERF_DELETE_ROWS"
 log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
+log "sessiongw_update_batch_rows=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}"
+log "sessiongw_delete_batch_rows=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}"
 
 "$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
 APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
@@ -228,22 +236,28 @@ PERF_SQL=$BASE_DIR/perf.sql
         printf ';\n'
     done
     echo "SELECT COUNT(*) AS C, SUM(ID) AS S FROM PERF_T;"
-    echo "UPDATE PERF_T SET NAME='Perf_updated' WHERE ID <= 10;"
-    echo "DELETE FROM PERF_T WHERE ID > $((PERF_ROWS - 5));"
-    echo "SELECT COUNT(*) AS C, SUM(ID) AS S, COUNT(CASE WHEN NAME='Perf_updated' THEN 1 END) AS U FROM PERF_T;"
 } > "$PERF_SQL"
 perf_start=$(date +%s)
+insert_start=$(date +%s)
 mysql --table < "$PERF_SQL" | tee -a "$REPORT"
+insert_end=$(date +%s)
+update_start=$(date +%s)
+mysql --table -e "USE $SCHEMA; UPDATE PERF_T SET NAME='Perf_updated' WHERE ID <= $PERF_UPDATE_ROWS; SELECT COUNT(*) AS U FROM PERF_T WHERE NAME='Perf_updated';" | tee -a "$REPORT"
+update_end=$(date +%s)
+delete_start=$(date +%s)
+mysql --table -e "USE $SCHEMA; DELETE FROM PERF_T WHERE ID > $((PERF_ROWS - PERF_DELETE_ROWS)); SELECT COUNT(*) AS C, SUM(ID) AS S, COUNT(CASE WHEN NAME='Perf_updated' THEN 1 END) AS U FROM PERF_T;" | tee -a "$REPORT"
+delete_end=$(date +%s)
 perf_end=$(date +%s)
-expected_perf_count=$((PERF_ROWS - 5))
-expected_perf_sum=$((PERF_ROWS * (PERF_ROWS + 1) / 2 - ((PERF_ROWS - 4 + PERF_ROWS) * 5 / 2)))
+expected_perf_count=$((PERF_ROWS - PERF_DELETE_ROWS))
+deleted_sum=$(((PERF_ROWS - PERF_DELETE_ROWS + 1 + PERF_ROWS) * PERF_DELETE_ROWS / 2))
+expected_perf_sum=$((PERF_ROWS * (PERF_ROWS + 1) / 2 - deleted_sum))
 PERF_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM PERF_T; SELECT SUM(ID) FROM PERF_T; SELECT COUNT(*) FROM PERF_T WHERE NAME='Perf_updated';" | paste -sd'|' -)
-EXPECTED_PERF="$expected_perf_count|$expected_perf_sum|10"
+EXPECTED_PERF="$expected_perf_count|$expected_perf_sum|$PERF_UPDATE_ROWS"
 if [[ "$PERF_FINAL" != "$EXPECTED_PERF" ]]; then
     echo "Unexpected performance baseline final state: expected $EXPECTED_PERF got $PERF_FINAL" >&2
     exit 1
 fi
-log "PASS performance baseline rows=$PERF_ROWS insert_batch=$PERF_INSERT_BATCH_ROWS seconds=$((perf_end - perf_start)) final=$PERF_FINAL"
+log "PASS performance baseline rows=$PERF_ROWS insert_batch=$PERF_INSERT_BATCH_ROWS update_rows=$PERF_UPDATE_ROWS delete_rows=$PERF_DELETE_ROWS insert_seconds=$((insert_end - insert_start)) update_seconds=$((update_end - update_start)) delete_seconds=$((delete_end - delete_start)) total_seconds=$((perf_end - perf_start)) final=$PERF_FINAL"
 
 # Concurrent reads.
 read_pids=()
