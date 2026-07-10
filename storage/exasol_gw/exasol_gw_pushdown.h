@@ -22,9 +22,11 @@ public:
 
   int open_pushed_query(TABLE *table_arg, const char *query_text, char *error_buffer,
                         unsigned long error_buffer_size);
-  int open_table_scan(TABLE *table_arg, char *error_buffer, unsigned long error_buffer_size);
+  int open_table_scan(TABLE *table_arg, char *error_buffer, unsigned long error_buffer_size,
+                      bool include_row_handles= false);
   int fetch_row(TABLE *table_arg, unsigned char *record, char *error_buffer,
                 unsigned long error_buffer_size);
+  exasol_gw::SessionGwRowHandle last_row_handle() const { return last_row_handle_; }
   int close(char *error_buffer, unsigned long error_buffer_size);
 
 private:
@@ -40,6 +42,8 @@ private:
   std::size_t current_row;
   bool end_of_cursor;
   std::vector<exasol_gw::ArrowColumnKind> column_kinds;
+  std::vector<exasol_gw::SessionGwRowHandle> current_row_handles;
+  exasol_gw::SessionGwRowHandle last_row_handle_;
 };
 
 class ha_exasol_gw_pushdown_handler_base

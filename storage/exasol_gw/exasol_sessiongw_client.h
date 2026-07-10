@@ -37,7 +37,11 @@ enum class SessionGwMessageType: std::uint16_t
   close_operation= 22,
   set_autocommit= 23,
   commit= 24,
-  rollback= 25
+  rollback= 25,
+  open_table_update= 26,
+  update_rows= 27,
+  open_table_delete= 28,
+  delete_rows= 29
 };
 
 struct SessionGwFrame
@@ -70,11 +74,18 @@ struct SessionGwOpenCursorResult
   std::vector<std::uint8_t> arrow_schema;
 };
 
+struct SessionGwRowHandle
+{
+  std::uint32_t node_id= 0;
+  std::uint64_t local_row_number= 0;
+};
+
 struct SessionGwFetchResult
 {
   std::uint64_t cursor_id= 0;
   bool end_of_cursor= false;
   std::vector<std::uint8_t> arrow_batch;
+  std::vector<SessionGwRowHandle> row_handles;
 };
 
 struct SessionGwDescribeTableResult
@@ -106,6 +117,7 @@ std::string read_string16(const std::vector<std::uint8_t> &bytes, std::size_t &o
 std::vector<std::uint8_t> read_bytes32(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
 
 SessionGwOptions options_from_environment();
+void execute_sql(const SessionGwOptions &options, const std::string &sql);
 
 class SessionGwConnection
 {
@@ -117,6 +129,7 @@ public:
   SessionGwConnection &operator=(const SessionGwConnection &)= delete;
 
   void connect_and_enter(const SessionGwOptions &options);
+  void execute_sql_command(const SessionGwOptions &options, const std::string &sql);
   void close();
 
   SessionGwDescribeTableResult describe_table(const std::string &schema,
@@ -125,7 +138,8 @@ public:
   SessionGwOpenCursorResult open_pushed_query(const std::string &sql);
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
-                                            const std::vector<std::string> &columns);
+                                            const std::vector<std::string> &columns,
+                                            bool include_row_handles= false);
   SessionGwOpenOperationResult open_table_insert(const std::string &schema,
                                                  const std::string &table,
                                                  const std::vector<std::string> &columns,
@@ -134,6 +148,19 @@ public:
   std::uint64_t insert_rows(std::uint64_t operation_id,
                             std::uint32_t row_count,
                             const std::vector<std::uint8_t> &native_batch);
+  SessionGwOpenOperationResult open_table_update(const std::string &schema,
+                                                 const std::string &table,
+                                                 const std::vector<std::string> &columns,
+                                                 std::uint32_t max_rows_per_batch,
+                                                 const std::vector<std::uint8_t> &arrow_schema);
+  std::uint64_t update_rows(std::uint64_t operation_id,
+                            const std::vector<SessionGwRowHandle> &row_handles,
+                            const std::vector<std::uint8_t> &native_batch);
+  SessionGwOpenOperationResult open_table_delete(const std::string &schema,
+                                                 const std::string &table,
+                                                 std::uint32_t max_rows_per_batch);
+  std::uint64_t delete_rows(std::uint64_t operation_id,
+                            const std::vector<SessionGwRowHandle> &row_handles);
   void close_operation(std::uint64_t operation_id);
   void set_autocommit(bool enabled);
   void commit();

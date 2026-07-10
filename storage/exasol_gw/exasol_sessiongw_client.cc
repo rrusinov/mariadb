@@ -468,7 +468,7 @@ class SessionGwConnection::Impl
 public:
   ~Impl() { close(); }
 
-  void connect_and_enter(const SessionGwOptions &options)
+  void connect_and_login(const SessionGwOptions &options)
   {
     close();
     options_= options;
@@ -477,12 +477,25 @@ public:
       enable_tls();
     websocket_upgrade();
     login();
+  }
+
+  void connect_and_enter(const SessionGwOptions &options)
+  {
+    connect_and_login(options);
     send_text("{\"command\":\"enterSessionGateway\",\"protocolVersion\":1}");
     require_status_ok(receive_text());
     send_frame(SessionGwMessageType::hello, {});
     SessionGwFrame hello= receive_frame();
     throw_if_error_frame(hello);
     require(hello.type == SessionGwMessageType::hello_ok, "SessionGW hello failed");
+  }
+
+  void execute_sql(const SessionGwOptions &options, const std::string &sql)
+  {
+    connect_and_login(options);
+    send_text("{\"command\":\"execute\",\"sqlText\":\"" + json_escape(sql) + "\"}");
+    require_status_ok(receive_text());
+    close();
   }
 
   void close()
@@ -558,7 +571,8 @@ public:
 
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
-                                            const std::vector<std::string> &columns)
+                                            const std::vector<std::string> &columns,
+                                            bool include_row_handles)
   {
     std::vector<std::uint8_t> payload;
     append_string32(payload, schema);
@@ -566,7 +580,7 @@ public:
     append_u32(payload, static_cast<std::uint32_t>(columns.size()));
     for (const std::string &column: columns)
       append_string32(payload, column);
-    append_u8(payload, 0);
+    append_u8(payload, include_row_handles ? 1 : 0);
     SessionGwFrame frame= request(SessionGwMessageType::open_table_scan,
                                   payload,
                                   SessionGwMessageType::open_cursor_result);
@@ -646,6 +660,13 @@ public:
     result.cursor_id= read_u64(frame.payload, offset);
     result.end_of_cursor= read_u8(frame.payload, offset) != 0;
     result.arrow_batch= read_bytes32(frame.payload, offset);
+    if (offset < frame.payload.size())
+    {
+      const std::uint32_t count= read_u32(frame.payload, offset);
+      result.row_handles.reserve(count);
+      for (std::uint32_t i= 0; i < count; ++i)
+        result.row_handles.push_back(SessionGwRowHandle{read_u32(frame.payload, offset), read_u64(frame.payload, offset)});
+    }
     return result;
   }
 
@@ -654,6 +675,69 @@ public:
     std::vector<std::uint8_t> payload;
     append_u64(payload, cursor_id);
     (void) request(SessionGwMessageType::close_cursor, payload, SessionGwMessageType::ok);
+  }
+
+  SessionGwOpenOperationResult open_table_update(const std::string &schema,
+                                                 const std::string &table,
+                                                 const std::vector<std::string> &columns,
+                                                 std::uint32_t max_rows_per_batch,
+                                                 const std::vector<std::uint8_t> &arrow_schema)
+  {
+    std::vector<std::uint8_t> payload;
+    append_string32(payload, schema);
+    append_string32(payload, table);
+    append_u32(payload, static_cast<std::uint32_t>(columns.size()));
+    for (const std::string &column: columns)
+      append_string32(payload, column);
+    append_u32(payload, max_rows_per_batch);
+    append_bytes32(payload, arrow_schema);
+    SessionGwFrame frame= request(SessionGwMessageType::open_table_update,
+                                  payload,
+                                  SessionGwMessageType::open_table_operation_result);
+    return parse_open_operation(frame);
+  }
+
+  std::uint64_t update_rows(std::uint64_t operation_id,
+                            const std::vector<SessionGwRowHandle> &row_handles,
+                            const std::vector<std::uint8_t> &native_batch)
+  {
+    std::vector<std::uint8_t> payload;
+    append_u64(payload, operation_id);
+    append_row_handles(payload, row_handles);
+    append_u32(payload, static_cast<std::uint32_t>(native_batch.size()));
+    const std::size_t aligned_size= (payload.size() + alignof(std::max_align_t) - 1U) & ~(alignof(std::max_align_t) - 1U);
+    payload.resize(aligned_size, 0U);
+    payload.insert(payload.end(), native_batch.begin(), native_batch.end());
+    SessionGwFrame frame= request(SessionGwMessageType::update_rows,
+                                  payload,
+                                  SessionGwMessageType::affected_rows_result);
+    return parse_affected_rows(frame);
+  }
+
+  SessionGwOpenOperationResult open_table_delete(const std::string &schema,
+                                                 const std::string &table,
+                                                 std::uint32_t max_rows_per_batch)
+  {
+    std::vector<std::uint8_t> payload;
+    append_string32(payload, schema);
+    append_string32(payload, table);
+    append_u32(payload, max_rows_per_batch);
+    SessionGwFrame frame= request(SessionGwMessageType::open_table_delete,
+                                  payload,
+                                  SessionGwMessageType::open_table_operation_result);
+    return parse_open_operation(frame);
+  }
+
+  std::uint64_t delete_rows(std::uint64_t operation_id,
+                            const std::vector<SessionGwRowHandle> &row_handles)
+  {
+    std::vector<std::uint8_t> payload;
+    append_u64(payload, operation_id);
+    append_row_handles(payload, row_handles);
+    SessionGwFrame frame= request(SessionGwMessageType::delete_rows,
+                                  payload,
+                                  SessionGwMessageType::affected_rows_result);
+    return parse_affected_rows(frame);
   }
 
 private:
@@ -796,6 +880,17 @@ private:
     return decode_sessiongw_frame(receive_websocket_payload());
   }
 
+  void append_row_handles(std::vector<std::uint8_t> &payload,
+                          const std::vector<SessionGwRowHandle> &row_handles)
+  {
+    append_u32(payload, static_cast<std::uint32_t>(row_handles.size()));
+    for (const SessionGwRowHandle &row_handle: row_handles)
+    {
+      append_u32(payload, row_handle.node_id);
+      append_u64(payload, row_handle.local_row_number);
+    }
+  }
+
   SessionGwFrame request(SessionGwMessageType type,
                          const std::vector<std::uint8_t> &payload,
                          SessionGwMessageType expected)
@@ -904,9 +999,20 @@ private:
 SessionGwConnection::SessionGwConnection(): impl_(new Impl()) {}
 SessionGwConnection::~SessionGwConnection()= default;
 
+void execute_sql(const SessionGwOptions &options, const std::string &sql)
+{
+  SessionGwConnection connection;
+  connection.execute_sql_command(options, sql);
+}
+
 void SessionGwConnection::connect_and_enter(const SessionGwOptions &options)
 {
   impl_->connect_and_enter(options);
+}
+
+void SessionGwConnection::execute_sql_command(const SessionGwOptions &options, const std::string &sql)
+{
+  impl_->execute_sql(options, sql);
 }
 
 void SessionGwConnection::close()
@@ -933,9 +1039,10 @@ SessionGwOpenCursorResult SessionGwConnection::open_pushed_query(const std::stri
 
 SessionGwOpenCursorResult SessionGwConnection::open_table_scan(const std::string &schema,
                                                                const std::string &table,
-                                                               const std::vector<std::string> &columns)
+                                                               const std::vector<std::string> &columns,
+                                                               bool include_row_handles)
 {
-  return impl_->open_table_scan(schema, table, columns);
+  return impl_->open_table_scan(schema, table, columns, include_row_handles);
 }
 
 SessionGwFetchResult SessionGwConnection::fetch(std::uint64_t cursor_id,
@@ -965,6 +1072,37 @@ std::uint64_t SessionGwConnection::insert_rows(std::uint64_t operation_id,
                                                const std::vector<std::uint8_t> &native_batch)
 {
   return impl_->insert_rows(operation_id, row_count, native_batch);
+}
+
+SessionGwOpenOperationResult SessionGwConnection::open_table_update(
+    const std::string &schema,
+    const std::string &table,
+    const std::vector<std::string> &columns,
+    std::uint32_t max_rows_per_batch,
+    const std::vector<std::uint8_t> &arrow_schema)
+{
+  return impl_->open_table_update(schema, table, columns, max_rows_per_batch, arrow_schema);
+}
+
+std::uint64_t SessionGwConnection::update_rows(std::uint64_t operation_id,
+                                               const std::vector<SessionGwRowHandle> &row_handles,
+                                               const std::vector<std::uint8_t> &native_batch)
+{
+  return impl_->update_rows(operation_id, row_handles, native_batch);
+}
+
+SessionGwOpenOperationResult SessionGwConnection::open_table_delete(
+    const std::string &schema,
+    const std::string &table,
+    std::uint32_t max_rows_per_batch)
+{
+  return impl_->open_table_delete(schema, table, max_rows_per_batch);
+}
+
+std::uint64_t SessionGwConnection::delete_rows(std::uint64_t operation_id,
+                                               const std::vector<SessionGwRowHandle> &row_handles)
+{
+  return impl_->delete_rows(operation_id, row_handles);
 }
 
 void SessionGwConnection::close_operation(std::uint64_t operation_id)

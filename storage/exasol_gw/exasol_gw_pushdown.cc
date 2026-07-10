@@ -164,7 +164,8 @@ int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
 
 int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
                                             char *error_buffer,
-                                            unsigned long error_buffer_size)
+                                            unsigned long error_buffer_size,
+                                            bool include_row_handles)
 {
   try
   {
@@ -174,7 +175,7 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
       columns.push_back(field_name(*field));
     connection.connect_and_enter(options);
     exasol_gw::SessionGwOpenCursorResult opened=
-        connection.open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns);
+        connection.open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns, include_row_handles);
     cursor_id= opened.cursor_id;
     current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
@@ -197,6 +198,7 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
       exasol_gw::SessionGwFetchResult fetched= connection.fetch(cursor_id, options.fetch_rows, 0);
       end_of_cursor= fetched.end_of_cursor;
       current_batch= exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
+      current_row_handles= fetched.row_handles;
       current_row= 0;
       if (current_batch.rows > 0)
         return 0;
@@ -237,6 +239,8 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
         (*field)->store(cell.value.data(), cell.value.size(), &my_charset_bin);
       }
     }
+    if (current_row < current_row_handles.size())
+      last_row_handle_= current_row_handles[current_row];
     ++current_row;
     return 0;
   }

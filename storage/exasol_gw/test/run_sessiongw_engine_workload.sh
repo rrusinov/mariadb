@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Live SessionGW-backed MariaDB ENGINE=EXASOL workload.
+# This intentionally mirrors the old rr.examariadb prototype's core coverage:
+# plugin load, DDL lifecycle, scan/pushdown, insert/update/delete, multi-session
+# stress, and direct Exasol final-state verification.
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MARIADB_SRC=${MARIADB_SRC:-$(cd "$SCRIPT_DIR/../../.." && pwd -P)}
+MARIADB_BUILD=${MARIADB_BUILD:-$MARIADB_SRC/build-sessiongw}
+DB_EXANANO=${DB_EXANANO:-$(cd "$MARIADB_SRC/../db.exanano" && pwd -P)}
+NANO_RUN=${NANO_RUN:-$DB_EXANANO/.build/exasol-nano-db-2026.2.0-nano.3-x86_64.run}
+BASE_DIR=${BASE_DIR:-${TMPDIR:-/tmp}/exasol-gw-mariadb-workload.$$}
+EXASOL_PORT=${EXASOL_PORT:-8571}
+SCHEMA=${SCHEMA:-SGW_MDB_COV}
+READ_CLIENTS=${READ_CLIENTS:-16}
+INSERT_CLIENTS=${INSERT_CLIENTS:-20}
+
+require_file() {
+    if [[ ! -e "$1" ]]; then
+        echo "Missing $1" >&2
+        exit 2
+    fi
+}
+
+require_file "$MARIADB_BUILD/sql/mariadbd"
+require_file "$MARIADB_BUILD/client/mariadb"
+require_file "$MARIADB_BUILD/scripts/mariadb-install-db"
+require_file "$MARIADB_BUILD/storage/exasol_gw/ha_exasol_gw.so"
+require_file "$NANO_RUN"
+
+NANO_BASE=$BASE_DIR/nano
+NANO_APP=$NANO_BASE/app
+NANO_DB=$NANO_BASE/db
+MDB=$BASE_DIR/mariadb
+SOCKET=$MDB/mariadb.sock
+PIDFILE=$MDB/mariadb.pid
+REPORT=$BASE_DIR/report.txt
+mkdir -p "$NANO_APP" "$NANO_DB" "$MDB"
+: >"$REPORT"
+
+cleanup() {
+    if [[ -f "$PIDFILE" ]]; then
+        kill "$(cat "$PIDFILE")" >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$NANO_BASE/pid" ]]; then
+        kill "$(cat "$NANO_BASE/pid")" >/dev/null 2>&1 || true
+    fi
+    pkill -f "$BASE_DIR" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
+
+sql_exasol() {
+    (cd "$DB_EXANANO" && c4 sqlclient --usetls --skiptlsverify --user sys --password exasol \
+        --connection localhost:$EXASOL_PORT --query "$1")
+}
+
+mysql() {
+    "$MARIADB_BUILD/client/mariadb" --no-defaults --socket="$SOCKET" "$@"
+}
+
+log "SessionGW MariaDB engine workload"
+log "base=$BASE_DIR"
+log "mariadb_build=$MARIADB_BUILD"
+log "nano_port=$EXASOL_PORT"
+
+"$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
+APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
+("$APPDIR/AppRun" --db-files-dir "$NANO_DB" --port "$EXASOL_PORT" >"$NANO_BASE/nano.log" 2>&1 & echo $! > "$NANO_BASE/pid")
+for _ in $(seq 1 90); do
+    if sql_exasol 'select 1' >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+sql_exasol 'select 1' >/dev/null
+log "PASS nano ready"
+
+"$MARIADB_BUILD/scripts/mariadb-install-db" --force --no-defaults \
+    --srcdir="$MARIADB_SRC" --builddir="$MARIADB_BUILD" --datadir="$MDB/data" \
+    --auth-root-authentication-method=normal >"$MDB/install.log" 2>&1
+
+EXASOL_SESSIONGW_HOST=localhost \
+EXASOL_SESSIONGW_PORT=$EXASOL_PORT \
+EXASOL_SESSIONGW_USER=sys \
+EXASOL_SESSIONGW_PASSWORD=exasol \
+EXASOL_SESSIONGW_TLS=skip_verify \
+"$MARIADB_BUILD/sql/mariadbd" --no-defaults \
+    --datadir="$MDB/data" --socket="$SOCKET" --pid-file="$PIDFILE" \
+    --port=0 --skip-networking \
+    --plugin-dir="$MARIADB_BUILD/storage/exasol_gw" \
+    --plugin-load-add=ha_exasol_gw.so \
+    --log-error="$MDB/mariadb.err" --skip-grant-tables --user="$(id -un)" \
+    >"$MDB/stdout.log" 2>&1 &
+
+for _ in $(seq 1 60); do
+    if mysql -e 'select 1' >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+mysql -e 'select 1' >/dev/null
+log "PASS mariadb ready"
+
+ENGINES=$(mysql --batch --raw -e 'SHOW ENGINES')
+echo "$ENGINES" | grep -Eq '^EXASOL[[:space:]]+YES'
+log "PASS show engines"
+
+mysql --table <<SQL | tee -a "$REPORT"
+DROP DATABASE IF EXISTS $SCHEMA;
+CREATE DATABASE $SCHEMA;
+USE $SCHEMA;
+CREATE TABLE T(ID BIGINT, NAME VARCHAR(40)) ENGINE=EXASOL;
+INSERT INTO T VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'), (4, 'Dave');
+SELECT * FROM T ORDER BY ID;
+UPDATE T SET NAME='Bobby' WHERE ID=2;
+DELETE FROM T WHERE ID=3;
+SELECT * FROM T ORDER BY ID;
+SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
+SQL
+log "PASS ddl insert update delete scan"
+
+# Concurrent reads.
+read_pids=()
+for i in $(seq 1 "$READ_CLIENTS"); do
+    (mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM T; SELECT SUM(ID) FROM T;" >"$BASE_DIR/read_$i.out") &
+    read_pids+=("$!")
+done
+for pid in "${read_pids[@]}"; do
+    wait "$pid"
+done
+log "PASS concurrent reads clients=$READ_CLIENTS"
+
+# Concurrent one-row inserts; adapter retries Exasol transaction collisions.
+insert_pids=()
+for i in $(seq 5 $((INSERT_CLIENTS + 4))); do
+    (mysql --batch --raw --skip-column-names -e "USE $SCHEMA; INSERT INTO T VALUES ($i, 'Name_$i');") &
+    insert_pids+=("$!")
+done
+for pid in "${insert_pids[@]}"; do
+    wait "$pid"
+done
+log "PASS concurrent inserts clients=$INSERT_CLIENTS"
+
+FINAL_ROWS=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM T; SELECT SUM(ID) FROM T; SELECT COUNT(*) FROM T WHERE NAME LIKE 'Name_%';")
+FINAL=$(echo "$FINAL_ROWS" | paste -sd'|' -)
+EXPECTED_COUNT=$((3 + INSERT_CLIENTS))
+EXPECTED_SUM=$((1 + 2 + 4 + ((5 + INSERT_CLIENTS + 4) * INSERT_CLIENTS / 2)))
+EXPECTED="$EXPECTED_COUNT|$EXPECTED_SUM|$INSERT_CLIENTS"
+if [[ "$FINAL" != "$EXPECTED" ]]; then
+    echo "Unexpected MariaDB final state: expected $EXPECTED got $FINAL" >&2
+    exit 1
+fi
+log "PASS mariadb final $FINAL"
+
+DIRECT=$(sql_exasol "select count(*), sum(id), count(case when name like 'Name_%' then 1 end) from $SCHEMA.T")
+echo "$DIRECT" | tee -a "$REPORT" >/dev/null
+log "PASS direct Exasol final verification"
+
+mysql -e "USE $SCHEMA; DROP TABLE T" >/dev/null
+ABSENT=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA' and table_name='T'")
+echo "$ABSENT" | grep -q '"data":\[\[0\]\]'
+log "PASS drop table removed backing Exasol table"
+
+log "SessionGW MariaDB engine workload passed"
