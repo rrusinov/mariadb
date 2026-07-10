@@ -76,8 +76,7 @@ struct SessionGwOpenCursorResult
 
 struct SessionGwRowHandle
 {
-  std::uint32_t node_id= 0;
-  std::uint64_t local_row_number= 0;
+  std::uint64_t row_number= 0;
 };
 
 struct SessionGwFetchResult
@@ -139,7 +138,8 @@ public:
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns,
-                                            bool include_row_handles= false);
+                                            bool include_row_handles= false,
+                                            const std::vector<SessionGwRowHandle> &row_handles= {});
   SessionGwOpenOperationResult open_table_insert(const std::string &schema,
                                                  const std::string &table,
                                                  const std::vector<std::string> &columns,

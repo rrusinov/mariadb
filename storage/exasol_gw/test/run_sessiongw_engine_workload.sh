@@ -160,6 +160,21 @@ SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
 SQL
 log "PASS ddl insert update delete scan"
 
+mysql --table <<SQL | tee -a "$REPORT"
+USE $SCHEMA;
+CREATE TABLE POS_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;
+INSERT INTO POS_T VALUES (1, 'One'), (2, 'Two'), (3, 'Three'), (4, 'Four');
+CREATE TABLE POS_KEYS(ID INT) ENGINE=InnoDB;
+INSERT INTO POS_KEYS VALUES (2), (3);
+UPDATE POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID SET p.NAME='Matched' WHERE k.ID=2;
+DELETE p FROM POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID WHERE k.ID=3;
+SELECT * FROM POS_T ORDER BY ID;
+SQL
+expect_scalar "positioned update/delete final" \
+    "USE $SCHEMA; SELECT CONCAT(COUNT(*), '|', SUM(CASE WHEN ID=2 AND NAME='Matched' THEN 1 ELSE 0 END), '|', SUM(CASE WHEN ID=3 THEN 1 ELSE 0 END)) FROM POS_T" \
+    "3|1|0"
+log "PASS positioned update delete"
+
 expect_scalar "prepared statement count" \
     "USE $SCHEMA; PREPARE s FROM 'SELECT COUNT(*) FROM T WHERE ID > ?'; SET @p=1; EXECUTE s USING @p; DEALLOCATE PREPARE s;" \
     "2"

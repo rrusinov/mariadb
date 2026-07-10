@@ -572,7 +572,8 @@ public:
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns,
-                                            bool include_row_handles)
+                                            bool include_row_handles,
+                                            const std::vector<SessionGwRowHandle> &row_handles= {})
   {
     std::vector<std::uint8_t> payload;
     append_string32(payload, schema);
@@ -581,6 +582,9 @@ public:
     for (const std::string &column: columns)
       append_string32(payload, column);
     append_u8(payload, include_row_handles ? 1 : 0);
+    append_u32(payload, static_cast<std::uint32_t>(row_handles.size()));
+    for (const SessionGwRowHandle &row_handle: row_handles)
+      append_u64(payload, row_handle.row_number);
     SessionGwFrame frame= request(SessionGwMessageType::open_table_scan,
                                   payload,
                                   SessionGwMessageType::open_cursor_result);
@@ -665,7 +669,7 @@ public:
       const std::uint32_t count= read_u32(frame.payload, offset);
       result.row_handles.reserve(count);
       for (std::uint32_t i= 0; i < count; ++i)
-        result.row_handles.push_back(SessionGwRowHandle{read_u32(frame.payload, offset), read_u64(frame.payload, offset)});
+        result.row_handles.push_back(SessionGwRowHandle{read_u64(frame.payload, offset)});
     }
     return result;
   }
@@ -886,8 +890,7 @@ private:
     append_u32(payload, static_cast<std::uint32_t>(row_handles.size()));
     for (const SessionGwRowHandle &row_handle: row_handles)
     {
-      append_u32(payload, row_handle.node_id);
-      append_u64(payload, row_handle.local_row_number);
+      append_u64(payload, row_handle.row_number);
     }
   }
 
@@ -1040,9 +1043,10 @@ SessionGwOpenCursorResult SessionGwConnection::open_pushed_query(const std::stri
 SessionGwOpenCursorResult SessionGwConnection::open_table_scan(const std::string &schema,
                                                                const std::string &table,
                                                                const std::vector<std::string> &columns,
-                                                               bool include_row_handles)
+                                                               bool include_row_handles,
+                                                               const std::vector<SessionGwRowHandle> &row_handles)
 {
-  return impl_->open_table_scan(schema, table, columns, include_row_handles);
+  return impl_->open_table_scan(schema, table, columns, include_row_handles, row_handles);
 }
 
 SessionGwFetchResult SessionGwConnection::fetch(std::uint64_t cursor_id,

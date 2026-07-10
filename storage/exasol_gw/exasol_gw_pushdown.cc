@@ -208,6 +208,37 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
   }
 }
 
+int ha_exasol_gw_cursor::open_table_scan_by_row_handle(TABLE *table_arg,
+                                                        const exasol_gw::SessionGwRowHandle &row_handle,
+                                                        char *error_buffer,
+                                                        unsigned long error_buffer_size)
+{
+  try
+  {
+    initialize_column_kinds(table_arg);
+    std::vector<std::string> columns;
+    for (Field **field= table_arg->field; *field; ++field)
+      columns.push_back(field_name(*field));
+    connection.connect_and_enter(options);
+    exasol_gw::SessionGwOpenCursorResult opened=
+        connection.open_table_scan(table_schema_name(table_arg),
+                                   table_object_name(table_arg),
+                                   columns,
+                                   false,
+                                   {row_handle});
+    cursor_id= opened.cursor_id;
+    current_batch= exasol_gw::ArrowRowBatch();
+    current_row= 0;
+    end_of_cursor= false;
+    return 0;
+  }
+  catch (const std::exception &ex)
+  {
+    copy_error(error_buffer, error_buffer_size, ex.what());
+    return HA_ERR_INTERNAL_ERROR;
+  }
+}
+
 int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long error_buffer_size)
 {
   try
