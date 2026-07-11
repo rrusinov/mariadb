@@ -76,9 +76,22 @@ void SessionGwThdContext::operation_closed()
     read_transaction_pending_= false;
 }
 
+void SessionGwThdContext::statement_table_opened()
+{
+  ++statement_tables_;
+}
+
+void SessionGwThdContext::statement_table_closed()
+{
+  if (statement_tables_ > 0)
+    --statement_tables_;
+  finish_idle_read_transaction();
+}
+
 void SessionGwThdContext::finish_idle_read_transaction()
 {
-  if (connected_ && read_transaction_pending_ && open_cursors_ == 0 && open_operations_ == 0)
+  if (connected_ && read_transaction_pending_ && open_cursors_ == 0 && open_operations_ == 0 &&
+      statement_tables_ == 0)
   {
     connection_.commit();
     read_transaction_pending_= false;
@@ -91,6 +104,7 @@ void SessionGwThdContext::reset()
   connected_= false;
   open_cursors_= 0;
   open_operations_= 0;
+  statement_tables_= 0;
   read_transaction_pending_= false;
 }
 

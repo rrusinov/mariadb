@@ -1385,11 +1385,25 @@ int ha_exasol_gw::end_bulk_insert()
   return close_insert_context();
 }
 
-int ha_exasol_gw::external_lock(THD *, int lock_type)
+int ha_exasol_gw::external_lock(THD *thd, int lock_type)
 {
-  if (lock_type == F_UNLCK)
-    return close_dml_contexts();
-  return 0;
+  try
+  {
+    if (lock_type != F_UNLCK)
+    {
+      exasol_gw::session_for_thd(thd).statement_table_opened();
+      return 0;
+    }
+
+    const int rc= close_dml_contexts();
+    exasol_gw::session_for_thd(thd).statement_table_closed();
+    return rc;
+  }
+  catch (const std::exception &ex)
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
+    return HA_ERR_INTERNAL_ERROR;
+  }
 }
 
 int ha_exasol_gw::close_insert_context()

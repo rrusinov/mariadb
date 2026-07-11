@@ -18,6 +18,8 @@ public:
   void read_cursor_closed();
   void operation_opened();
   void operation_closed();
+  void statement_table_opened();
+  void statement_table_closed();
   void reset();
 
 private:
@@ -28,6 +30,7 @@ private:
   bool connected_= false;
   std::size_t open_cursors_= 0;
   std::size_t open_operations_= 0;
+  std::size_t statement_tables_= 0;
   bool read_transaction_pending_= false;
 };
 
