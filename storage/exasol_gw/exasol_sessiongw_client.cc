@@ -354,9 +354,13 @@ void throw_if_error_frame(const SessionGwFrame &frame)
   std::size_t offset= 0;
   const std::uint16_t category= read_u16(frame.payload, offset);
   const std::string message= read_string16(frame.payload, offset);
+  if (category < static_cast<std::uint16_t>(SessionGwErrorCategory::protocol_error) ||
+      category > static_cast<std::uint16_t>(SessionGwErrorCategory::transport_error))
+    throw SessionGwError(SessionGwErrorCategory::protocol_error,
+                         "SessionGW error frame has an unknown category");
   std::ostringstream out;
   out << "SessionGW error " << category << ": " << message;
-  throw SessionGwError(out.str());
+  throw SessionGwError(static_cast<SessionGwErrorCategory>(category), out.str());
 }
 
 } // namespace

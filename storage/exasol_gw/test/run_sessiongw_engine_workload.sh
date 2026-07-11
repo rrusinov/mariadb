@@ -17,6 +17,8 @@ EXASOL_PORT=${EXASOL_PORT:-8571}
 SCHEMA=${SCHEMA:-SGW_MDB_COV}
 READ_CLIENTS=${READ_CLIENTS:-16}
 INSERT_CLIENTS=${INSERT_CLIENTS:-20}
+INSERT_ROUNDS=${INSERT_ROUNDS:-1}
+INSERT_ROWS_PER_CLIENT=${INSERT_ROWS_PER_CLIENT:-1}
 PERF_ROWS=${PERF_ROWS:-100000}
 PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
 PERF_UPDATE_ROWS=${PERF_UPDATE_ROWS:-$((PERF_ROWS / 10))}
@@ -132,6 +134,8 @@ log "perf_rows=$PERF_ROWS"
 log "perf_insert_batch_rows=$PERF_INSERT_BATCH_ROWS"
 log "perf_update_rows=$PERF_UPDATE_ROWS"
 log "perf_delete_rows=$PERF_DELETE_ROWS"
+log "insert_rounds=$INSERT_ROUNDS"
+log "insert_rows_per_client=$INSERT_ROWS_PER_CLIENT"
 log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
 log "sessiongw_update_batch_rows=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}"
 log "sessiongw_delete_batch_rows=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}"
@@ -399,22 +403,59 @@ for pid in "${read_pids[@]}"; do
 done
 log "PASS concurrent reads clients=$READ_CLIENTS"
 
-# Concurrent one-row inserts; adapter retries Exasol transaction collisions.
-insert_pids=()
-for i in $(seq 5 $((INSERT_CLIENTS + 4))); do
-    (mysql --batch --raw --skip-column-names -e "USE $SCHEMA; INSERT INTO T VALUES ($i, 'Name_$i');") &
-    insert_pids+=("$!")
+# Concurrent insert statements either commit completely or propagate a MariaDB
+# deadlock error for Exasol transaction conflicts. The adapter must not replay.
+for round in $(seq 0 $((INSERT_ROUNDS - 1))); do
+    insert_pids=()
+    for client in $(seq 0 $((INSERT_CLIENTS - 1))); do
+        first_id=$((5 + (round * INSERT_CLIENTS + client) * INSERT_ROWS_PER_CLIENT))
+        last_id=$((first_id + INSERT_ROWS_PER_CLIENT - 1))
+        result_file="$BASE_DIR/insert_${round}_${client}.result"
+        error_file="$BASE_DIR/insert_${round}_${client}.err"
+        values=""
+        for i in $(seq "$first_id" "$last_id"); do
+            values+="${values:+,}($i, 'Name_$i')"
+        done
+        (
+            if mysql --batch --raw --skip-column-names \
+                -e "USE $SCHEMA; INSERT INTO T VALUES $values;" 2>"$error_file"; then
+                echo "committed $first_id $last_id" >"$result_file"
+            elif grep -q "ERROR 1213" "$error_file"; then
+                echo "conflict $first_id $last_id" >"$result_file"
+            else
+                cat "$error_file" >&2
+                exit 1
+            fi
+        ) &
+        insert_pids+=("$!")
+    done
+    for pid in "${insert_pids[@]}"; do
+        wait "$pid"
+    done
 done
-for pid in "${insert_pids[@]}"; do
-    wait "$pid"
+
+EXPECTED_COUNT=3
+EXPECTED_SUM=7
+EXPECTED_NAMES=0
+COMMITTED_WRITERS=0
+CONFLICTED_WRITERS=0
+for result_file in "$BASE_DIR"/insert_*.result; do
+    read -r outcome first_id last_id <"$result_file"
+    if [[ "$outcome" == "committed" ]]; then
+        rows=$((last_id - first_id + 1))
+        EXPECTED_COUNT=$((EXPECTED_COUNT + rows))
+        EXPECTED_SUM=$((EXPECTED_SUM + (first_id + last_id) * rows / 2))
+        EXPECTED_NAMES=$((EXPECTED_NAMES + rows))
+        COMMITTED_WRITERS=$((COMMITTED_WRITERS + 1))
+    else
+        CONFLICTED_WRITERS=$((CONFLICTED_WRITERS + 1))
+    fi
 done
-log "PASS concurrent inserts clients=$INSERT_CLIENTS"
+log "PASS concurrent inserts clients=$INSERT_CLIENTS rounds=$INSERT_ROUNDS rows_per_client=$INSERT_ROWS_PER_CLIENT committed=$COMMITTED_WRITERS conflicts=$CONFLICTED_WRITERS"
 
 FINAL_ROWS=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM T; SELECT SUM(ID) FROM T; SELECT COUNT(*) FROM T WHERE NAME LIKE 'Name_%';")
 FINAL=$(echo "$FINAL_ROWS" | paste -sd'|' -)
-EXPECTED_COUNT=$((3 + INSERT_CLIENTS))
-EXPECTED_SUM=$((1 + 2 + 4 + ((5 + INSERT_CLIENTS + 4) * INSERT_CLIENTS / 2)))
-EXPECTED="$EXPECTED_COUNT|$EXPECTED_SUM|$INSERT_CLIENTS"
+EXPECTED="$EXPECTED_COUNT|$EXPECTED_SUM|$EXPECTED_NAMES"
 if [[ "$FINAL" != "$EXPECTED" ]]; then
     echo "Unexpected MariaDB final state: expected $EXPECTED got $FINAL" >&2
     exit 1

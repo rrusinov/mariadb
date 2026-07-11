@@ -51,10 +51,36 @@ struct SessionGwFrame
   std::vector<std::uint8_t> payload;
 };
 
+enum class SessionGwErrorCategory: std::uint16_t
+{
+  protocol_error= 1,
+  authentication_failed= 2,
+  not_authorized= 3,
+  object_not_found= 4,
+  unsupported_type= 5,
+  unsupported_operation= 6,
+  transaction_conflict= 7,
+  constraint_violation= 8,
+  resource_limit= 9,
+  cursor_not_found= 10,
+  internal_error= 11,
+  transport_error= 12
+};
+
 class SessionGwError: public std::runtime_error
 {
 public:
-  explicit SessionGwError(const std::string &message): std::runtime_error(message) {}
+  explicit SessionGwError(const std::string &message)
+    : std::runtime_error(message), category_(SessionGwErrorCategory::transport_error)
+  {}
+  SessionGwError(SessionGwErrorCategory category, const std::string &message)
+    : std::runtime_error(message), category_(category)
+  {}
+
+  SessionGwErrorCategory category() const noexcept { return category_; }
+
+private:
+  SessionGwErrorCategory category_;
 };
 
 struct SessionGwOptions

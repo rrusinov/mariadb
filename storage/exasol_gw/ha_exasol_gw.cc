@@ -15,7 +15,6 @@
 #include "exasol_native_write_batch.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,7 +22,6 @@
 #include <new>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,11 +47,24 @@ bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
                             std::string *sql, std::string *error);
 std::string drop_table_sql_from_path(const char *from);
 
+int report_sessiongw_error(const exasol_gw::SessionGwError &error) noexcept
+{
+  if (error.category() == exasol_gw::SessionGwErrorCategory::transaction_conflict)
+    return HA_ERR_LOCK_DEADLOCK;
+  if (!current_thd->get_stmt_da()->is_set())
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.what());
+  return HA_ERR_INTERNAL_ERROR;
+}
+
 int report_handler_exception(const char *operation) noexcept
 {
   try
   {
     throw;
+  }
+  catch (const exasol_gw::SessionGwError &error)
+  {
+    return report_sessiongw_error(error);
   }
   catch (const std::bad_alloc &)
   {
@@ -1001,15 +1012,6 @@ std::uint32_t delete_batch_rows_from_environment()
   return batch_rows_from_environment("EXASOL_SESSIONGW_DELETE_BATCH_ROWS");
 }
 
-bool is_retryable_insert_failure(const std::string &message)
-{
-  return message.find("Transaction collision") != std::string::npos ||
-         message.find("GlobalTransactionRollback") != std::string::npos ||
-         message.find("unexpected eof") != std::string::npos ||
-         message.find("socket closed") != std::string::npos ||
-         message.find("WebSocket close received") != std::string::npos;
-}
-
 class DbugReadSetGuard
 {
  public:
@@ -1065,6 +1067,11 @@ struct InsertContext
         return flush(table);
       return 0;
     }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
+    }
     catch (const std::exception &ex)
     {
       abort();
@@ -1084,10 +1091,15 @@ struct InsertContext
         return rc;
       return close_operation();
     }
-    catch (const std::exception &ex)
+    catch (const exasol_gw::SessionGwError &error)
     {
       abort();
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
+      return report_sessiongw_error(error);
+    }
+    catch (const std::exception &error)
+    {
+      abort();
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.what());
       return HA_ERR_INTERNAL_ERROR;
     }
   }
@@ -1117,61 +1129,27 @@ struct InsertContext
     try
     {
       ensure_operation_open(table);
-      const std::uint64_t affected= connection->insert_rows(operation_id, pending_rows, batch);
+      const std::uint64_t affected=
+          connection->insert_rows(operation_id, pending_rows, batch);
       if (affected != pending_rows)
       {
         abort();
         return HA_ERR_INTERNAL_ERROR;
       }
-      ++successful_batches;
       reset_pending();
       return 0;
     }
-    catch (const std::exception &ex)
+    catch (const exasol_gw::SessionGwError &error)
     {
-      const std::string error= ex.what();
-      if (successful_batches == 0 && is_retryable_insert_failure(error))
-        return retry_pending_first_batch(table, batch, pending_rows, error);
       abort();
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.c_str());
+      return report_sessiongw_error(error);
+    }
+    catch (const std::exception &error)
+    {
+      abort();
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.what());
       return HA_ERR_INTERNAL_ERROR;
     }
-  }
-
-  int retry_pending_first_batch(TABLE *table,
-                                const std::vector<std::uint8_t> &batch,
-                                std::uint32_t rows,
-                                std::string last_error)
-  {
-    reset_operation_after_error();
-    constexpr int max_attempts= 8;
-    for (int attempt= 1; attempt < max_attempts; ++attempt)
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(25 * attempt));
-      try
-      {
-        ensure_operation_open(table);
-        const std::uint64_t affected= connection->insert_rows(operation_id, rows, batch);
-        if (affected != rows)
-        {
-          abort();
-          return HA_ERR_INTERNAL_ERROR;
-        }
-        ++successful_batches;
-        reset_pending();
-        return 0;
-      }
-      catch (const std::exception &ex)
-      {
-        last_error= ex.what();
-        reset_operation_after_error();
-        if (!is_retryable_insert_failure(last_error))
-          break;
-      }
-    }
-    abort();
-    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, last_error.c_str());
-    return HA_ERR_INTERNAL_ERROR;
   }
 
   void ensure_operation_open(TABLE *table)
@@ -1192,28 +1170,11 @@ struct InsertContext
   {
     if (!operation_open)
       return 0;
-    try
-    {
-      connection->close_operation(operation_id);
-      operation_open= false;
-      operation_id= 0;
-      successful_batches= 0;
-      session->operation_closed();
-      return 0;
-    }
-    catch (...)
-    {
-      abort();
-      throw;
-    }
-  }
-
-  void reset_operation_after_error()
-  {
-    session->reset();
-    connection= nullptr;
+    connection->close_operation(operation_id);
     operation_open= false;
     operation_id= 0;
+    session->operation_closed();
+    return 0;
   }
 
   void abort()
@@ -1224,7 +1185,6 @@ struct InsertContext
     connection= nullptr;
     operation_open= false;
     operation_id= 0;
-    successful_batches= 0;
     reset_pending();
     failed= true;
   }
@@ -1247,7 +1207,6 @@ struct InsertContext
   exasol_gw::SessionGwDescribeTableResult described;
   std::uint32_t max_rows_per_batch= 10000;
   std::uint32_t pending_rows= 0;
-  std::uint32_t successful_batches= 0;
   std::vector<NativeColumnBuffer> pending_columns;
 };
 
@@ -1290,6 +1249,11 @@ struct UpdateContext
         return flush(table);
       return 0;
     }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
+    }
     catch (const std::exception &ex)
     {
       abort();
@@ -1308,6 +1272,11 @@ struct UpdateContext
       if (rc != 0)
         return rc;
       return close_operation();
+    }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
     }
     catch (const std::exception &ex)
     {
@@ -1349,6 +1318,11 @@ struct UpdateContext
       }
       reset_pending();
       return 0;
+    }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
     }
     catch (const std::exception &ex)
     {
@@ -1446,6 +1420,11 @@ struct DeleteContext
         return flush(table);
       return 0;
     }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
+    }
     catch (const std::exception &ex)
     {
       abort();
@@ -1464,6 +1443,11 @@ struct DeleteContext
       if (rc != 0)
         return rc;
       return close_operation();
+    }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
     }
     catch (const std::exception &ex)
     {
@@ -1496,6 +1480,11 @@ struct DeleteContext
       }
       pending_handles.clear();
       return 0;
+    }
+    catch (const exasol_gw::SessionGwError &error)
+    {
+      abort();
+      return report_sessiongw_error(error);
     }
     catch (const std::exception &ex)
     {

@@ -20,6 +20,8 @@ namespace
 {
 void connect_with_retry(SessionGwConnection &connection, const SessionGwOptions &options)
 {
+  // Only bootstrap of a fresh physical session is repeated here. No cursor or
+  // write request has been issued, and active SessionGW work is never replayed.
   constexpr int max_attempts= 40;
   for (int attempt= 0; ; ++attempt)
   {
@@ -28,10 +30,11 @@ void connect_with_retry(SessionGwConnection &connection, const SessionGwOptions 
       connection.connect_and_enter(options);
       return;
     }
-    catch (...)
+    catch (const SessionGwError &error)
     {
       connection.close();
-      if (attempt + 1 >= max_attempts)
+      if (error.category() != SessionGwErrorCategory::transport_error ||
+          attempt + 1 >= max_attempts)
         throw;
       std::this_thread::sleep_for(
           std::chrono::milliseconds(std::min(250, 25 * (attempt + 1))));
