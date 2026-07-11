@@ -10,6 +10,7 @@
 #include "sql_lex.h"
 #include "sql_select.h"
 
+#include "exasol_arrow_ipc.h"
 #include "exasol_gw_pushdown.h"
 #include "exasol_native_write_batch.h"
 
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -82,6 +84,7 @@ class Exasol_gw_share: public Handler_share
 public:
   mysql_mutex_t mutex;
   THR_LOCK lock;
+  std::string remote_table_version;
 
   Exasol_gw_share()
   {
@@ -146,7 +149,7 @@ public:
       if (!share)
         return HA_ERR_OUT_OF_MEM;
       thr_lock_data_init(&share->lock, &lock, nullptr);
-      return 0;
+      return validate_remote_metadata();
     }
     catch (...)
     {
@@ -186,6 +189,7 @@ public:
         return HA_ERR_UNSUPPORTED;
       }
 
+      exasol_gw::session_for_thd(ha_thd()).reset();
       exasol_gw::SessionGwOptions options= exasol_gw::options_from_environment();
       exasol_gw::execute_sql(options,
                              "CREATE SCHEMA IF NOT EXISTS " +
@@ -203,6 +207,7 @@ public:
   {
     try
     {
+      exasol_gw::session_for_thd(ha_thd()).reset();
       exasol_gw::execute_sql(exasol_gw::options_from_environment(), drop_table_sql_from_path(from));
       return 0;
     }
@@ -237,6 +242,9 @@ public:
     try
     {
       (void) rnd_end();
+      const int validation_rc= validate_remote_metadata();
+      if (validation_rc != 0)
+        return validation_rc;
       have_positioned_row_handle= false;
       cursor= new ha_exasol_gw_cursor(table->in_use);
       if (!cursor)
@@ -310,6 +318,9 @@ public:
   {
     try
     {
+      const int validation_rc= validate_remote_metadata();
+      if (validation_rc != 0)
+        return validation_rc;
       const exasol_gw::SessionGwRowHandle row_handle= row_handle_from_ref(pos);
       ha_exasol_gw_cursor positioned_cursor(table->in_use);
       char error_buffer[512]= {0};
@@ -356,6 +367,7 @@ public:
   }
 
   int external_lock(THD *, int lock_type) override;
+  int validate_remote_metadata();
 
   enum_alter_inplace_result check_if_supported_inplace_alter(TABLE *, Alter_inplace_info *) override
   {
@@ -625,6 +637,86 @@ bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
   }
   *sql += ")";
   return true;
+}
+
+struct LocalColumnDescription
+{
+  std::string type_id;
+  std::int32_t precision= 0;
+  std::int32_t scale= 0;
+  std::int64_t char_length= 0;
+};
+
+LocalColumnDescription local_column_description(Field *field)
+{
+  LocalColumnDescription result;
+  switch (field->real_type())
+  {
+  case MYSQL_TYPE_TINY:
+    result.type_id= "DTM_decimal";
+    result.precision= 3;
+    break;
+  case MYSQL_TYPE_SHORT:
+    result.type_id= "DTM_decimal";
+    result.precision= field->is_unsigned() ? 5 : 9;
+    break;
+  case MYSQL_TYPE_INT24:
+    result.type_id= "DTM_decimal";
+    result.precision= field->is_unsigned() ? 8 : 9;
+    break;
+  case MYSQL_TYPE_LONG:
+    result.type_id= "DTM_decimal";
+    result.precision= field->is_unsigned() ? 10 : 18;
+    break;
+  case MYSQL_TYPE_LONGLONG:
+    result.type_id= "DTM_decimal";
+    result.precision= 18;
+    break;
+  case MYSQL_TYPE_YEAR:
+    result.type_id= "DTM_decimal";
+    result.precision= 4;
+    break;
+  case MYSQL_TYPE_DECIMAL:
+  case MYSQL_TYPE_NEWDECIMAL:
+    result.type_id= "DTM_decimal";
+    result.scale= static_cast<std::int32_t>(field->decimals());
+    result.precision= field->real_type() == MYSQL_TYPE_NEWDECIMAL
+                         ? static_cast<std::int32_t>(
+                               static_cast<Field_new_decimal *>(field)->precision)
+                         : static_cast<std::int32_t>(my_decimal_length_to_precision(
+                               field->field_length, field->decimals(), field->is_unsigned()));
+    break;
+  case MYSQL_TYPE_FLOAT:
+  case MYSQL_TYPE_DOUBLE:
+    result.type_id= "DTM_double";
+    break;
+  case MYSQL_TYPE_DATE:
+  case MYSQL_TYPE_NEWDATE:
+    result.type_id= "DTM_date";
+    break;
+  case MYSQL_TYPE_DATETIME:
+  case MYSQL_TYPE_DATETIME2:
+  case MYSQL_TYPE_TIMESTAMP:
+  case MYSQL_TYPE_TIMESTAMP2:
+    result.type_id= "DTM_timestamp";
+    result.precision= static_cast<std::int32_t>(field->decimals());
+    break;
+  case MYSQL_TYPE_BIT:
+    result.type_id= "DTM_boolean";
+    break;
+  case MYSQL_TYPE_STRING:
+    result.type_id= "DTM_char";
+    result.char_length= field->char_length();
+    break;
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_VARCHAR:
+    result.type_id= "DTM_varchar";
+    result.char_length= field->char_length();
+    break;
+  default:
+    throw std::runtime_error("unsupported local MariaDB column metadata");
+  }
+  return result;
 }
 
 std::string drop_table_sql_from_path(const char *from)
@@ -1007,7 +1099,7 @@ struct InsertContext
     schema= table_schema_name(table);
     object= table_object_name(table);
     columns= table_column_names(table);
-    described= connection->describe_table(schema, object);
+    described= session->describe_table(schema, object);
     initialized= true;
   }
 
@@ -1232,7 +1324,7 @@ struct UpdateContext
     schema= table_schema_name(table);
     object= table_object_name(table);
     columns= table_column_names(table);
-    described= connection->describe_table(schema, object);
+    described= session->describe_table(schema, object);
     initialized= true;
   }
 
@@ -1488,10 +1580,68 @@ ha_exasol_gw::~ha_exasol_gw()
   }
 }
 
+int ha_exasol_gw::validate_remote_metadata()
+{
+  const std::string schema= table_schema_name(table);
+  const std::string object= table_object_name(table);
+  const exasol_gw::SessionGwDescribeTableResult described=
+      exasol_gw::session_for_thd(table->in_use).describe_table(schema, object);
+  if (described.schema_name != schema || described.table_name != object ||
+      described.table_version.empty())
+    throw std::runtime_error("SessionGW returned inconsistent remote table identity metadata");
+
+  const std::vector<exasol_gw::ArrowFieldDescription> remote_fields=
+      exasol_gw::decode_arrow_schema(described.arrow_schema);
+  std::size_t local_count= 0;
+  while (table->field[local_count])
+    ++local_count;
+  if (remote_fields.size() != local_count)
+    throw std::runtime_error("MariaDB and remote EXASOL tables have different column counts");
+
+  for (std::size_t index= 0; index < local_count; ++index)
+  {
+    Field *field= table->field[index];
+    const bool nullable= (field->flags & NOT_NULL_FLAG) == 0;
+    const LocalColumnDescription local= local_column_description(field);
+    if (remote_fields[index].name != field_name(field) ||
+        remote_fields[index].nullable != nullable ||
+        remote_fields[index].exasol_type_id != local.type_id ||
+        remote_fields[index].precision != local.precision ||
+        remote_fields[index].scale != local.scale ||
+        remote_fields[index].char_length != local.char_length)
+    {
+      throw std::runtime_error(
+          "MariaDB column metadata does not match remote EXASOL column '" +
+          field_name(field) + "'");
+    }
+  }
+
+  bool version_changed= false;
+  mysql_mutex_lock(&share->mutex);
+  if (share->remote_table_version.empty())
+    share->remote_table_version= described.table_version;
+  else
+    version_changed= share->remote_table_version != described.table_version;
+  mysql_mutex_unlock(&share->mutex);
+  if (version_changed)
+    throw std::runtime_error(
+        "Remote EXASOL table was changed or replaced; recreate the MariaDB table definition");
+  return 0;
+}
+
+int validate_exasol_gw_table_metadata(TABLE *table)
+{
+  if (!table || !table->file || table->file->partition_ht() != exasol_gw_hton)
+    return HA_ERR_WRONG_COMMAND;
+  return static_cast<ha_exasol_gw *>(table->file)->validate_remote_metadata();
+}
+
 void ha_exasol_gw::start_bulk_insert(ha_rows, uint)
 {
   try
   {
+    if (validate_remote_metadata() != 0)
+      return;
     if (!insert_context)
       insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
     if (!insert_context)
@@ -1581,7 +1731,12 @@ int ha_exasol_gw::write_row(const uchar *)
   try
   {
     if (!insert_context)
+    {
+      const int validation_rc= validate_remote_metadata();
+      if (validation_rc != 0)
+        return validation_rc;
       insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
+    }
     if (!insert_context)
       return HA_ERR_OUT_OF_MEM;
     return insert_context->append(table);
@@ -1599,7 +1754,12 @@ int ha_exasol_gw::update_row(const uchar *, const uchar *new_data)
     if (new_data != table->record[0])
       return HA_ERR_WRONG_COMMAND;
     if (!update_context)
+    {
+      const int validation_rc= validate_remote_metadata();
+      if (validation_rc != 0)
+        return validation_rc;
       update_context= new UpdateContext(update_batch_rows_from_environment(), table->in_use);
+    }
     if (!update_context)
       return HA_ERR_OUT_OF_MEM;
     const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
@@ -1619,7 +1779,12 @@ int ha_exasol_gw::delete_row(const uchar *)
   try
   {
     if (!delete_context)
+    {
+      const int validation_rc= validate_remote_metadata();
+      if (validation_rc != 0)
+        return validation_rc;
       delete_context= new DeleteContext(delete_batch_rows_from_environment(), table->in_use);
+    }
     if (!delete_context)
       return HA_ERR_OUT_OF_MEM;
     const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle

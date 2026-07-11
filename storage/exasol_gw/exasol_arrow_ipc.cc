@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace exasol_gw
 {
@@ -71,9 +73,10 @@ struct FlatTable
   {
     require(table + 4 <= size, "truncated flatbuffer table");
     const std::int32_t vtable_distance= le32s(base + table);
-    require(vtable_distance >= 0 && table >= static_cast<std::size_t>(vtable_distance),
+    const std::int64_t vtable_location= static_cast<std::int64_t>(table) - vtable_distance;
+    require(vtable_location >= 0 && static_cast<std::uint64_t>(vtable_location) < size,
             "invalid flatbuffer vtable distance");
-    const std::size_t vtable= table - static_cast<std::size_t>(vtable_distance);
+    const std::size_t vtable= static_cast<std::size_t>(vtable_location);
     require(vtable + 4 <= size, "truncated flatbuffer vtable");
     const std::uint16_t vtable_size= le16(base + vtable);
     const std::size_t entry= vtable + 4U + static_cast<std::size_t>(field) * 2U;
@@ -119,6 +122,26 @@ struct FlatTable
     return FlatTable{base, size, target};
   }
 
+  std::string string_field(std::uint16_t field) const
+  {
+    const std::size_t loc= field_location(field);
+    require(loc + 4 <= size, "truncated flatbuffer string uoffset");
+    const std::size_t target= loc + le32(base + loc);
+    require(target + 4 <= size, "flatbuffer string outside buffer");
+    const std::uint32_t length= le32(base + target);
+    require(length <= size - target - 4U, "truncated flatbuffer string");
+    return std::string(reinterpret_cast<const char *>(base + target + 4U), length);
+  }
+
+  FlatTable vector_table(std::size_t vector, std::uint32_t index) const
+  {
+    const std::size_t loc= vector + static_cast<std::size_t>(index) * 4U;
+    require(loc + 4 <= size, "truncated flatbuffer table vector");
+    const std::size_t target= loc + le32(base + loc);
+    require(target < size, "flatbuffer vector table outside buffer");
+    return FlatTable{base, size, target};
+  }
+
   std::size_t vector_start(std::uint16_t field, std::uint32_t *length) const
   {
     const std::size_t loc= field_location(field);
@@ -149,6 +172,80 @@ FlatTable root_table(const std::uint8_t *metadata, std::size_t metadata_size)
   const std::size_t root= le32(metadata);
   require(root < metadata_size, "flatbuffer root outside metadata");
   return FlatTable{metadata, metadata_size, root};
+}
+
+std::string metadata_value(const FlatTable &field, const std::string &key)
+{
+  if (!field.has(6))
+    return std::string();
+  std::uint32_t count= 0;
+  const std::size_t metadata= field.vector_start(6, &count);
+  require(metadata + static_cast<std::size_t>(count) * 4U <= field.size,
+          "truncated Arrow field metadata vector");
+  for (std::uint32_t index= 0; index < count; ++index)
+  {
+    const FlatTable entry= field.vector_table(metadata, index);
+    if (entry.has(0) && entry.string_field(0) == key)
+      return entry.has(1) ? entry.string_field(1) : std::string();
+  }
+  return std::string();
+}
+
+std::int64_t metadata_integer(const FlatTable &field, const std::string &key)
+{
+  const std::string value= metadata_value(field, key);
+  if (value.empty())
+    return 0;
+  char *end= nullptr;
+  const long long parsed= std::strtoll(value.c_str(), &end, 10);
+  require(end && *end == '\0', "invalid integer in Arrow field metadata");
+  return static_cast<std::int64_t>(parsed);
+}
+
+std::vector<ArrowFieldDescription> parse_schema_metadata(
+    const std::vector<std::uint8_t> &ipc)
+{
+  require(ipc.size() >= 4, "truncated Arrow IPC schema message");
+  std::size_t offset= 0;
+  std::uint32_t metadata_size= le32(ipc.data());
+  if (metadata_size == 0xffffffffU)
+  {
+    require(ipc.size() >= 8, "truncated Arrow IPC schema continuation message");
+    metadata_size= le32(ipc.data() + 4);
+    offset= 8;
+  }
+  else
+    offset= 4;
+  require(metadata_size > 0 && metadata_size <= ipc.size() - offset,
+          "invalid Arrow IPC schema metadata size");
+
+  const FlatTable message= root_table(ipc.data() + offset, metadata_size);
+  require(message.u8_field(1, 0) == 1, "Arrow IPC message is not a Schema");
+  const FlatTable schema= message.table_field(2);
+  std::uint32_t field_count= 0;
+  const std::size_t fields= schema.vector_start(1, &field_count);
+  require(fields + static_cast<std::size_t>(field_count) * 4U <= metadata_size,
+          "truncated Arrow schema field vector");
+
+  std::vector<ArrowFieldDescription> result;
+  result.reserve(field_count);
+  for (std::uint32_t index= 0; index < field_count; ++index)
+  {
+    const FlatTable field= schema.vector_table(fields, index);
+    require(field.has(0), "Arrow schema field has no name");
+    ArrowFieldDescription description;
+    description.name= field.string_field(0);
+    description.nullable= field.u8_field(1, 0) != 0;
+    description.exasol_type_id= metadata_value(field, "exasol.type_id");
+    require(!description.exasol_type_id.empty(),
+            "Arrow schema field has no Exasol type identifier metadata");
+    description.precision= static_cast<std::int32_t>(
+        metadata_integer(field, "exasol.precision"));
+    description.scale= static_cast<std::int32_t>(metadata_integer(field, "exasol.scale"));
+    description.char_length= metadata_integer(field, "exasol.char_length");
+    result.push_back(std::move(description));
+  }
+  return result;
 }
 
 RecordBatchMeta parse_record_batch_metadata(const std::vector<std::uint8_t> &ipc,
@@ -271,6 +368,12 @@ std::size_t buffer_count_for(ArrowColumnKind kind)
 }
 
 } // namespace
+
+std::vector<ArrowFieldDescription> decode_arrow_schema(
+    const std::vector<std::uint8_t> &ipc_message)
+{
+  return parse_schema_metadata(ipc_message);
+}
 
 ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_message,
                                         const std::vector<ArrowColumnKind> &columns)

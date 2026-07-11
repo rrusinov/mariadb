@@ -188,6 +188,20 @@ SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
 SQL
 log "PASS ddl insert update delete scan"
 
+mysql -e "USE $SCHEMA; CREATE TABLE META_GUARD(ID INT, NAME VARCHAR(20)) ENGINE=EXASOL; INSERT INTO META_GUARD VALUES (1, 'bound'); SELECT * FROM META_GUARD" >/dev/null
+sql_exasol "DROP TABLE $SCHEMA.META_GUARD" >/dev/null
+sql_exasol "CREATE TABLE $SCHEMA.META_GUARD(ID DECIMAL(18,0), NAME VARCHAR(21) UTF8)" >/dev/null
+expect_failure_contains "incompatible remote metadata" \
+    "USE $SCHEMA; SELECT * FROM META_GUARD" \
+    "MariaDB column metadata does not match remote EXASOL column 'NAME'"
+sql_exasol "DROP TABLE $SCHEMA.META_GUARD" >/dev/null
+sql_exasol "CREATE TABLE $SCHEMA.META_GUARD(ID DECIMAL(18,0), NAME VARCHAR(20) UTF8)" >/dev/null
+expect_failure_contains "replaced remote table generation" \
+    "USE $SCHEMA; SELECT * FROM META_GUARD" \
+    "Remote EXASOL table was changed or replaced"
+mysql -e "USE $SCHEMA; DROP TABLE META_GUARD" >/dev/null
+log "PASS remote metadata compatibility and generation invalidation"
+
 if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
     expect_failure_contains "cursor constructor allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_cursor_constructor_oom'; USE $SCHEMA; SELECT * FROM T" \

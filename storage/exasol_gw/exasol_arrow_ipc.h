@@ -31,6 +31,19 @@ struct ArrowRowBatch
   std::size_t rows= 0;
 };
 
+struct ArrowFieldDescription
+{
+  std::string name;
+  std::string exasol_type_id;
+  bool nullable= true;
+  std::int32_t precision= 0;
+  std::int32_t scale= 0;
+  std::int64_t char_length= 0;
+};
+
+std::vector<ArrowFieldDescription> decode_arrow_schema(
+    const std::vector<std::uint8_t> &ipc_message);
+
 ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_message,
                                         const std::vector<ArrowColumnKind> &columns);
 

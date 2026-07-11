@@ -50,6 +50,25 @@ SessionGwConnection &SessionGwThdContext::connection()
   return connection_;
 }
 
+SessionGwDescribeTableResult SessionGwThdContext::describe_table(
+    const std::string &schema, const std::string &table)
+{
+  SessionGwConnection &session= connection();
+  for (SessionGwDescribeTableResult &cached: metadata_cache_)
+  {
+    if (cached.schema_name != schema || cached.table_name != table)
+      continue;
+    const std::string current_version= session.get_table_version(schema, table);
+    if (current_version != cached.table_version)
+      cached= session.describe_table(schema, table);
+    return cached;
+  }
+
+  SessionGwDescribeTableResult described= session.describe_table(schema, table);
+  metadata_cache_.push_back(described);
+  return described;
+}
+
 void SessionGwThdContext::read_cursor_opened()
 {
   ++open_cursors_;
@@ -106,6 +125,7 @@ void SessionGwThdContext::reset()
   open_operations_= 0;
   statement_tables_= 0;
   read_transaction_pending_= false;
+  metadata_cache_.clear();
 }
 
 SessionGwThdContext &session_for_thd(THD *thd)

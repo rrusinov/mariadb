@@ -4,6 +4,8 @@
 #include "exasol_sessiongw_client.h"
 
 #include <cstddef>
+#include <string>
+#include <vector>
 
 class THD;
 
@@ -14,6 +16,8 @@ class SessionGwThdContext
 {
 public:
   SessionGwConnection &connection();
+  SessionGwDescribeTableResult describe_table(const std::string &schema,
+                                               const std::string &table);
   void read_cursor_opened();
   void read_cursor_closed();
   void operation_opened();
@@ -32,6 +36,7 @@ private:
   std::size_t open_operations_= 0;
   std::size_t statement_tables_= 0;
   bool read_transaction_pending_= false;
+  std::vector<SessionGwDescribeTableResult> metadata_cache_;
 };
 
 SessionGwThdContext &session_for_thd(THD *thd);

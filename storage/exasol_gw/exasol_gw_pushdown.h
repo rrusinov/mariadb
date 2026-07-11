@@ -14,6 +14,8 @@
 
 class ha_exasol_gw;
 
+int validate_exasol_gw_table_metadata(TABLE *table);
+
 class ha_exasol_gw_cursor
 {
 public:

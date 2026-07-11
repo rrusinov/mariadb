@@ -460,6 +460,10 @@ int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *thd_arg,
       return HA_ERR_INTERNAL_ERROR;
     }
 
+    const int validation_rc= validate_exasol_gw_table_metadata(query_table);
+    if (validation_rc != 0)
+      return validation_rc;
+
     cursor= new ha_exasol_gw_cursor(thd_arg);
     if (!cursor)
       return HA_ERR_OUT_OF_MEM;
