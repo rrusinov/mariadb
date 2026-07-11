@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -44,6 +46,35 @@ std::string quote_exasol_identifier(const std::string &identifier);
 bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
                             std::string *sql, std::string *error);
 std::string drop_table_sql_from_path(const char *from);
+
+int report_handler_exception(const char *operation) noexcept
+{
+  try
+  {
+    throw;
+  }
+  catch (const std::bad_alloc &)
+  {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: out of memory", operation);
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_OUT_OF_MEM, message);
+    return HA_ERR_OUT_OF_MEM;
+  }
+  catch (const std::exception &ex)
+  {
+    char message[512];
+    std::snprintf(message, sizeof(message), "%s: %.400s", operation, ex.what());
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, message);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  catch (...)
+  {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: unknown C++ exception", operation);
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, message);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+}
 }
 
 class Exasol_gw_share: public Handler_share
@@ -109,38 +140,52 @@ public:
 
   int open(const char *, int, uint) override
   {
-    share= get_share();
-    if (!share)
-      return HA_ERR_OUT_OF_MEM;
-    thr_lock_data_init(&share->lock, &lock, nullptr);
-    return 0;
+    try
+    {
+      share= get_share();
+      if (!share)
+        return HA_ERR_OUT_OF_MEM;
+      thr_lock_data_init(&share->lock, &lock, nullptr);
+      return 0;
+    }
+    catch (...)
+    {
+      return report_handler_exception("opening EXASOL handler");
+    }
   }
 
   int close(void) override
   {
-    return rnd_end();
+    try
+    {
+      return rnd_end();
+    }
+    catch (...)
+    {
+      return report_handler_exception("closing EXASOL handler");
+    }
   }
 
   int create(const char *, TABLE *form, HA_CREATE_INFO *create_info) override
   {
-    const int sql_command= thd_sql_command(ha_thd());
-    if (sql_command == SQLCOM_ALTER_TABLE || sql_command == SQLCOM_TRUNCATE)
-    {
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
-               "ALTER and TRUNCATE are not supported for EXASOL tables");
-      return HA_ERR_UNSUPPORTED;
-    }
-
-    std::string table_sql;
-    std::string error;
-    if (!build_create_table_sql(form, create_info, &table_sql, &error))
-    {
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED, error.c_str());
-      return HA_ERR_UNSUPPORTED;
-    }
-
     try
     {
+      const int sql_command= thd_sql_command(ha_thd());
+      if (sql_command == SQLCOM_ALTER_TABLE || sql_command == SQLCOM_TRUNCATE)
+      {
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
+                 "ALTER and TRUNCATE are not supported for EXASOL tables");
+        return HA_ERR_UNSUPPORTED;
+      }
+
+      std::string table_sql;
+      std::string error;
+      if (!build_create_table_sql(form, create_info, &table_sql, &error))
+      {
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED, error.c_str());
+        return HA_ERR_UNSUPPORTED;
+      }
+
       exasol_gw::SessionGwOptions options= exasol_gw::options_from_environment();
       exasol_gw::execute_sql(options,
                              "CREATE SCHEMA IF NOT EXISTS " +
@@ -148,10 +193,9 @@ public:
       exasol_gw::execute_sql(options, table_sql);
       return 0;
     }
-    catch (const std::exception &ex)
+    catch (...)
     {
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
-      return HA_ERR_INTERNAL_ERROR;
+      return report_handler_exception("creating EXASOL table");
     }
   }
 
@@ -162,10 +206,9 @@ public:
       exasol_gw::execute_sql(exasol_gw::options_from_environment(), drop_table_sql_from_path(from));
       return 0;
     }
-    catch (const std::exception &ex)
+    catch (...)
     {
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
-      return HA_ERR_INTERNAL_ERROR;
+      return report_handler_exception("dropping EXASOL table");
     }
   }
 
@@ -191,78 +234,112 @@ public:
 
   int rnd_init(bool) override
   {
-    (void) rnd_end();
-    have_positioned_row_handle= false;
-    cursor= new ha_exasol_gw_cursor(table->in_use);
-    char error_buffer[512]= {0};
-    const int rc= cursor->open_table_scan(table, error_buffer, sizeof(error_buffer), true);
-    if (rc != 0)
+    try
+    {
+      (void) rnd_end();
+      have_positioned_row_handle= false;
+      cursor= new ha_exasol_gw_cursor(table->in_use);
+      if (!cursor)
+        return HA_ERR_OUT_OF_MEM;
+      char error_buffer[512]= {0};
+      const int rc= cursor->open_table_scan(table, error_buffer, sizeof(error_buffer), true);
+      if (rc != 0)
+      {
+        delete cursor;
+        cursor= nullptr;
+        my_error(ER_GET_ERRNO, MYF(0), rc,
+                 error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW table scan");
+      }
+      return rc;
+    }
+    catch (...)
     {
       delete cursor;
       cursor= nullptr;
-      my_error(ER_GET_ERRNO, MYF(0), rc,
-               error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW table scan");
+      return report_handler_exception("starting EXASOL table scan");
     }
-    return rc;
   }
 
   int rnd_end() override
   {
-    if (!cursor)
-      return 0;
-    char error_buffer[512]= {0};
-    const int rc= cursor->close(error_buffer, sizeof(error_buffer));
-    delete cursor;
-    cursor= nullptr;
-    if (rc != 0)
+    try
     {
-      my_error(ER_GET_ERRNO, MYF(0), rc,
-               error_buffer[0] ? error_buffer : "failed to close EXASOL SessionGW table scan");
+      if (!cursor)
+        return 0;
+      char error_buffer[512]= {0};
+      const int rc= cursor->close(error_buffer, sizeof(error_buffer));
+      delete cursor;
+      cursor= nullptr;
+      if (rc != 0)
+      {
+        my_error(ER_GET_ERRNO, MYF(0), rc,
+                 error_buffer[0] ? error_buffer : "failed to close EXASOL SessionGW table scan");
+      }
+      return rc;
     }
-    return rc;
+    catch (...)
+    {
+      delete cursor;
+      cursor= nullptr;
+      return report_handler_exception("ending EXASOL table scan");
+    }
   }
 
   int rnd_next(uchar *buf) override
   {
-    if (!cursor)
-      return HA_ERR_END_OF_FILE;
-    char error_buffer[512]= {0};
-    const int rc= cursor->fetch_row(table, buf, error_buffer, sizeof(error_buffer));
-    if (rc != 0 && rc != HA_ERR_END_OF_FILE)
+    try
     {
-      my_error(ER_GET_ERRNO, MYF(0), rc,
-               error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW table row");
+      if (!cursor)
+        return HA_ERR_END_OF_FILE;
+      char error_buffer[512]= {0};
+      const int rc= cursor->fetch_row(table, buf, error_buffer, sizeof(error_buffer));
+      if (rc != 0 && rc != HA_ERR_END_OF_FILE)
+      {
+        my_error(ER_GET_ERRNO, MYF(0), rc,
+                 error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW table row");
+      }
+      return rc;
     }
-    return rc;
+    catch (...)
+    {
+      return report_handler_exception("fetching EXASOL table row");
+    }
   }
 
   int rnd_pos(uchar *buf, uchar *pos) override
   {
-    const exasol_gw::SessionGwRowHandle row_handle= row_handle_from_ref(pos);
-    ha_exasol_gw_cursor positioned_cursor(table->in_use);
-    char error_buffer[512]= {0};
-    const int open_rc= positioned_cursor.open_table_scan_by_row_handle(table,
-                                                                       row_handle,
-                                                                       error_buffer,
-                                                                       sizeof(error_buffer));
-    if (open_rc != 0)
+    try
     {
-      my_error(ER_GET_ERRNO, MYF(0), open_rc,
-               error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW positioned scan");
-      return open_rc;
+      const exasol_gw::SessionGwRowHandle row_handle= row_handle_from_ref(pos);
+      ha_exasol_gw_cursor positioned_cursor(table->in_use);
+      char error_buffer[512]= {0};
+      const int open_rc= positioned_cursor.open_table_scan_by_row_handle(table,
+                                                                         row_handle,
+                                                                         error_buffer,
+                                                                         sizeof(error_buffer));
+      if (open_rc != 0)
+      {
+        my_error(ER_GET_ERRNO, MYF(0), open_rc,
+                 error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW positioned scan");
+        return open_rc;
+      }
+      const int fetch_rc= positioned_cursor.fetch_row(table, buf, error_buffer, sizeof(error_buffer));
+      if (fetch_rc != 0)
+      {
+        if (fetch_rc == HA_ERR_END_OF_FILE)
+          return HA_ERR_RECORD_DELETED;
+        my_error(ER_GET_ERRNO, MYF(0), fetch_rc,
+                 error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW positioned row");
+        return fetch_rc;
+      }
+      last_positioned_row_handle= row_handle;
+      have_positioned_row_handle= true;
+      return 0;
     }
-    const int fetch_rc= positioned_cursor.fetch_row(table, buf, error_buffer, sizeof(error_buffer));
-    if (fetch_rc != 0)
+    catch (...)
     {
-      if (fetch_rc == HA_ERR_END_OF_FILE)
-        return HA_ERR_RECORD_DELETED;
-      my_error(ER_GET_ERRNO, MYF(0), fetch_rc,
-               error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW positioned row");
-      return fetch_rc;
+      return report_handler_exception("reading positioned EXASOL row");
     }
-    last_positioned_row_handle= row_handle;
-    have_positioned_row_handle= true;
-    return 0;
   }
   void position(const uchar *) override
   {
@@ -299,22 +376,16 @@ public:
 private:
   Exasol_gw_share *get_share()
   {
-    if (!share)
+    lock_shared_ha_data();
+    auto *result= static_cast<Exasol_gw_share *>(get_ha_share_ptr());
+    if (!result)
     {
-      lock_shared_ha_data();
-      if (!share)
-      {
-        share= new Exasol_gw_share();
-        if (!share)
-        {
-          unlock_shared_ha_data();
-          return nullptr;
-        }
-        set_ha_share_ref(reinterpret_cast<Handler_share **>(&share));
-      }
-      unlock_shared_ha_data();
+      result= new Exasol_gw_share();
+      if (result)
+        set_ha_share_ptr(static_cast<Handler_share *>(result));
     }
-    return share;
+    unlock_shared_ha_data();
+    return result;
   }
 
   int close_insert_context();
@@ -847,16 +918,37 @@ bool is_retryable_insert_failure(const std::string &message)
          message.find("WebSocket close received") != std::string::npos;
 }
 
+class DbugReadSetGuard
+{
+ public:
+  explicit DbugReadSetGuard(TABLE *table_arg)
+    : table(table_arg), saved(dbug_tmp_use_all_columns(table, &table->read_set))
+  {}
+
+  ~DbugReadSetGuard()
+  {
+    dbug_tmp_restore_column_map(&table->read_set, saved);
+  }
+
+ private:
+  TABLE *table;
+  MY_BITMAP *saved;
+};
+
 struct InsertContext
 {
   InsertContext(std::uint32_t max_rows, THD *thd)
-    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
-      max_rows_per_batch(max_rows) {}
+    : session(&exasol_gw::session_for_thd(thd)), connection(nullptr),
+      max_rows_per_batch(max_rows)
+  {
+    DBUG_EXECUTE_IF("exasol_gw_insert_context_constructor_oom", throw std::bad_alloc(););
+  }
 
   int append(TABLE *table)
   {
     try
     {
+      DbugReadSetGuard read_set_guard(table);
       ensure_operation_open(table);
       if (pending_columns.empty())
       {
@@ -1070,13 +1162,17 @@ struct InsertContext
 struct UpdateContext
 {
   UpdateContext(std::uint32_t max_rows, THD *thd)
-    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
-      max_rows_per_batch(max_rows) {}
+    : session(&exasol_gw::session_for_thd(thd)), connection(nullptr),
+      max_rows_per_batch(max_rows)
+  {
+    DBUG_EXECUTE_IF("exasol_gw_update_context_constructor_oom", throw std::bad_alloc(););
+  }
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
   {
     try
     {
+      DbugReadSetGuard read_set_guard(table);
       ensure_operation_open(table);
       if (pending_columns.empty())
       {
@@ -1165,13 +1261,16 @@ struct UpdateContext
     catch (const std::exception &ex)
     {
       abort();
-      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
+      if (!current_thd->get_stmt_da()->is_set())
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
   }
 
   void ensure_operation_open(TABLE *table)
   {
+    if (!connection)
+      connection= &session->connection();
     ensure_open(table);
     if (operation_open)
       return;
@@ -1239,8 +1338,11 @@ struct UpdateContext
 struct DeleteContext
 {
   DeleteContext(std::uint32_t max_rows, THD *thd)
-    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
-      max_rows_per_batch(max_rows) {}
+    : session(&exasol_gw::session_for_thd(thd)), connection(nullptr),
+      max_rows_per_batch(max_rows)
+  {
+    DBUG_EXECUTE_IF("exasol_gw_delete_context_constructor_oom", throw std::bad_alloc(););
+  }
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
   {
@@ -1313,6 +1415,8 @@ struct DeleteContext
 
   void ensure_operation_open(TABLE *table)
   {
+    if (!connection)
+      connection= &session->connection();
     ensure_open(table);
     if (operation_open)
       return;
@@ -1370,19 +1474,47 @@ struct DeleteContext
 
 ha_exasol_gw::~ha_exasol_gw()
 {
-  (void) close_dml_contexts();
-  delete cursor;
+  try
+  {
+    (void) close_dml_contexts();
+    delete cursor;
+  }
+  catch (...)
+  {
+    delete insert_context;
+    delete update_context;
+    delete delete_context;
+    delete cursor;
+  }
 }
 
 void ha_exasol_gw::start_bulk_insert(ha_rows, uint)
 {
-  if (!insert_context)
-    insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
+  try
+  {
+    if (!insert_context)
+      insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
+    if (!insert_context)
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_OUT_OF_MEM,
+               "starting EXASOL bulk insert: out of memory");
+  }
+  catch (...)
+  {
+    insert_context= nullptr;
+    (void) report_handler_exception("starting EXASOL bulk insert");
+  }
 }
 
 int ha_exasol_gw::end_bulk_insert()
 {
-  return close_insert_context();
+  try
+  {
+    return close_insert_context();
+  }
+  catch (...)
+  {
+    return report_handler_exception("ending EXASOL bulk insert");
+  }
 }
 
 int ha_exasol_gw::external_lock(THD *thd, int lock_type)
@@ -1399,10 +1531,9 @@ int ha_exasol_gw::external_lock(THD *thd, int lock_type)
     exasol_gw::session_for_thd(thd).statement_table_closed();
     return rc;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return report_handler_exception("changing EXASOL statement lock state");
   }
 }
 
@@ -1410,33 +1541,27 @@ int ha_exasol_gw::close_insert_context()
 {
   if (!insert_context)
     return 0;
-  InsertContext *context= insert_context;
+  std::unique_ptr<InsertContext> context(insert_context);
   insert_context= nullptr;
-  const int rc= context->close(table);
-  delete context;
-  return rc;
+  return context->close(table);
 }
 
 int ha_exasol_gw::close_update_context()
 {
   if (!update_context)
     return 0;
-  UpdateContext *context= update_context;
+  std::unique_ptr<UpdateContext> context(update_context);
   update_context= nullptr;
-  const int rc= context->close(table);
-  delete context;
-  return rc;
+  return context->close(table);
 }
 
 int ha_exasol_gw::close_delete_context()
 {
   if (!delete_context)
     return 0;
-  DeleteContext *context= delete_context;
+  std::unique_ptr<DeleteContext> context(delete_context);
   delete_context= nullptr;
-  const int rc= context->close(table);
-  delete context;
-  return rc;
+  return context->close(table);
 }
 
 int ha_exasol_gw::close_dml_contexts()
@@ -1453,46 +1578,75 @@ int ha_exasol_gw::close_dml_contexts()
 
 int ha_exasol_gw::write_row(const uchar *)
 {
-  if (!insert_context)
-    insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
-  if (!insert_context)
-    return HA_ERR_OUT_OF_MEM;
-  return insert_context->append(table);
+  try
+  {
+    if (!insert_context)
+      insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
+    if (!insert_context)
+      return HA_ERR_OUT_OF_MEM;
+    return insert_context->append(table);
+  }
+  catch (...)
+  {
+    return report_handler_exception("writing EXASOL row");
+  }
 }
 
 int ha_exasol_gw::update_row(const uchar *, const uchar *new_data)
 {
-  if (new_data != table->record[0])
-    return HA_ERR_WRONG_COMMAND;
-  if (!update_context)
-    update_context= new UpdateContext(update_batch_rows_from_environment(), table->in_use);
-  if (!update_context)
-    return HA_ERR_OUT_OF_MEM;
-  const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
-      ? last_positioned_row_handle
-      : (cursor ? cursor->last_row_handle() : row_handle_from_ref(ref));
-  have_positioned_row_handle= false;
-  return update_context->append(table, row_handle);
+  try
+  {
+    if (new_data != table->record[0])
+      return HA_ERR_WRONG_COMMAND;
+    if (!update_context)
+      update_context= new UpdateContext(update_batch_rows_from_environment(), table->in_use);
+    if (!update_context)
+      return HA_ERR_OUT_OF_MEM;
+    const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
+        ? last_positioned_row_handle
+        : (cursor ? cursor->last_row_handle() : row_handle_from_ref(ref));
+    have_positioned_row_handle= false;
+    return update_context->append(table, row_handle);
+  }
+  catch (...)
+  {
+    return report_handler_exception("updating EXASOL row");
+  }
 }
 
 int ha_exasol_gw::delete_row(const uchar *)
 {
-  if (!delete_context)
-    delete_context= new DeleteContext(delete_batch_rows_from_environment(), table->in_use);
-  if (!delete_context)
-    return HA_ERR_OUT_OF_MEM;
-  const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
-      ? last_positioned_row_handle
-      : (cursor ? cursor->last_row_handle() : row_handle_from_ref(ref));
-  have_positioned_row_handle= false;
-  return delete_context->append(table, row_handle);
+  try
+  {
+    if (!delete_context)
+      delete_context= new DeleteContext(delete_batch_rows_from_environment(), table->in_use);
+    if (!delete_context)
+      return HA_ERR_OUT_OF_MEM;
+    const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
+        ? last_positioned_row_handle
+        : (cursor ? cursor->last_row_handle() : row_handle_from_ref(ref));
+    have_positioned_row_handle= false;
+    return delete_context->append(table, row_handle);
+  }
+  catch (...)
+  {
+    return report_handler_exception("deleting EXASOL row");
+  }
 }
 
 static handler *exasol_gw_create_handler(handlerton *hton,
                                             TABLE_SHARE *table,
                                             MEM_ROOT *mem_root)
 {
-  return new (mem_root) ha_exasol_gw(hton, table);
+  try
+  {
+    return new (mem_root) ha_exasol_gw(hton, table);
+  }
+  catch (...)
+  {
+    (void) report_handler_exception("allocating EXASOL handler");
+    return nullptr;
+  }
 }
 
 static bool exasol_gw_table_belongs_to_engine(TABLE_LIST *tbl)
@@ -1597,67 +1751,98 @@ static select_handler *create_exasol_gw_select_handler(THD *thd,
                                                           SELECT_LEX *sel_lex,
                                                           SELECT_LEX_UNIT *lex_unit)
 {
-  if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
-    return nullptr;
+  try
+  {
+    if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
+      return nullptr;
 
-  if (!is_supported_exasol_gw_select(sel_lex))
-    return nullptr;
+    if (!is_supported_exasol_gw_select(sel_lex))
+      return nullptr;
 
-  TABLE *tbl= get_exasol_gw_table_for_pushdown(sel_lex);
-  if (!tbl)
-    return nullptr;
+    TABLE *tbl= get_exasol_gw_table_for_pushdown(sel_lex);
+    if (!tbl)
+      return nullptr;
 
-  if (sel_lex->uncacheable & UNCACHEABLE_SIDEEFFECT)
-    return nullptr;
+    if (sel_lex->uncacheable & UNCACHEABLE_SIDEEFFECT)
+      return nullptr;
 
-  return new ha_exasol_gw_select_handler(thd, sel_lex, lex_unit, tbl);
+    return new ha_exasol_gw_select_handler(thd, sel_lex, lex_unit, tbl);
+  }
+  catch (...)
+  {
+    (void) report_handler_exception("creating EXASOL SELECT pushdown handler");
+    return nullptr;
+  }
 }
 
 static select_handler *create_exasol_gw_unit_handler(THD *thd,
                                                         SELECT_LEX_UNIT *lex_unit)
 {
-  if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
-    return nullptr;
+  try
+  {
+    if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
+      return nullptr;
 
-  if (!are_supported_exasol_gw_selects(lex_unit))
-    return nullptr;
+    if (!are_supported_exasol_gw_selects(lex_unit))
+      return nullptr;
 
-  TABLE *tbl= get_exasol_gw_table_for_unit_pushdown(lex_unit);
-  if (!tbl)
-    return nullptr;
+    TABLE *tbl= get_exasol_gw_table_for_unit_pushdown(lex_unit);
+    if (!tbl)
+      return nullptr;
 
-  if (lex_unit->uncacheable & UNCACHEABLE_SIDEEFFECT)
-    return nullptr;
+    if (lex_unit->uncacheable & UNCACHEABLE_SIDEEFFECT)
+      return nullptr;
 
-  return new ha_exasol_gw_select_handler(thd, lex_unit, tbl);
+    return new ha_exasol_gw_select_handler(thd, lex_unit, tbl);
+  }
+  catch (...)
+  {
+    (void) report_handler_exception("creating EXASOL unit pushdown handler");
+    return nullptr;
+  }
 }
 
 static derived_handler *create_exasol_gw_derived_handler(THD *thd,
                                                             TABLE_LIST *derived)
 {
-  if (!derived || !derived->derived)
-    return nullptr;
+  try
+  {
+    if (!derived || !derived->derived)
+      return nullptr;
 
-  if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
-    return nullptr;
+    if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
+      return nullptr;
 
-  if (!are_supported_exasol_gw_selects(derived->derived))
-    return nullptr;
+    if (!are_supported_exasol_gw_selects(derived->derived))
+      return nullptr;
 
-  TABLE *tbl= get_exasol_gw_table_for_unit_pushdown(derived->derived);
-  if (!tbl)
-    return nullptr;
+    TABLE *tbl= get_exasol_gw_table_for_unit_pushdown(derived->derived);
+    if (!tbl)
+      return nullptr;
 
-  if (derived->derived->uncacheable & UNCACHEABLE_SIDEEFFECT)
-    return nullptr;
+    if (derived->derived->uncacheable & UNCACHEABLE_SIDEEFFECT)
+      return nullptr;
 
-  return new ha_exasol_gw_derived_handler(thd, derived, tbl);
+    return new ha_exasol_gw_derived_handler(thd, derived, tbl);
+  }
+  catch (...)
+  {
+    (void) report_handler_exception("creating EXASOL derived pushdown handler");
+    return nullptr;
+  }
 }
 
 static int exasol_gw_close_connection(THD *thd)
 {
-  exasol_gw::destroy_session_for_thd(thd);
-  return 0;
+  try
+  {
+    exasol_gw::destroy_session_for_thd(thd);
+    return 0;
+  }
+  catch (...)
+  {
+    return report_handler_exception("closing EXASOL THD connection");
+  }
 }
 
 static int exasol_gw_init(void *p)

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <sstream>
 
 extern handlerton *exasol_gw_hton;
@@ -22,14 +23,71 @@ extern handlerton *exasol_gw_hton;
 namespace
 {
 
-void copy_error(char *buffer, unsigned long buffer_size, const std::string &message)
+void copy_error(char *buffer, unsigned long buffer_size, const char *message) noexcept
 {
   if (!buffer || buffer_size == 0)
     return;
-  const std::size_t size= std::min<std::size_t>(buffer_size - 1U, message.size());
-  std::memcpy(buffer, message.data(), size);
+  const char *text= message ? message : "unknown error";
+  const std::size_t size= std::min<std::size_t>(buffer_size - 1U, std::strlen(text));
+  std::memcpy(buffer, text, size);
   buffer[size]= '\0';
 }
+
+int copy_current_exception(char *buffer,
+                           unsigned long buffer_size,
+                           const char *operation) noexcept
+{
+  try
+  {
+    throw;
+  }
+  catch (const std::bad_alloc &)
+  {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: out of memory", operation);
+    copy_error(buffer, buffer_size, message);
+    return HA_ERR_OUT_OF_MEM;
+  }
+  catch (const std::exception &ex)
+  {
+    char message[512];
+    std::snprintf(message, sizeof(message), "%s: %.400s", operation, ex.what());
+    copy_error(buffer, buffer_size, message);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  catch (...)
+  {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: unknown C++ exception", operation);
+    copy_error(buffer, buffer_size, message);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+}
+
+int report_pushdown_exception(const char *operation) noexcept
+{
+  char message[512]= {0};
+  const int rc= copy_current_exception(message, sizeof(message), operation);
+  my_error(ER_GET_ERRNO, MYF(0), rc, message);
+  return rc;
+}
+
+class DbugWriteSetGuard
+{
+ public:
+  explicit DbugWriteSetGuard(TABLE *table_arg)
+    : table(table_arg), saved(dbug_tmp_use_all_columns(table, &table->write_set))
+  {}
+
+  ~DbugWriteSetGuard()
+  {
+    dbug_tmp_restore_column_map(&table->write_set, saved);
+  }
+
+ private:
+  TABLE *table;
+  MY_BITMAP *saved;
+};
 
 std::string apply_decimal_scale(const std::string &integer_value, uint scale)
 {
@@ -136,13 +194,14 @@ exasol_gw::ArrowColumnKind kind_for_field(Field *field)
 
 ha_exasol_gw_cursor::ha_exasol_gw_cursor(THD *thd_arg)
   : session(&exasol_gw::session_for_thd(thd_arg)),
-    connection(&session->connection()),
+    connection(nullptr),
     options(exasol_gw::options_from_environment()),
     cursor_id(0),
     cursor_registered(false),
     current_row(0),
     end_of_cursor(false)
 {
+  DBUG_EXECUTE_IF("exasol_gw_cursor_constructor_oom", throw std::bad_alloc(););
 }
 
 ha_exasol_gw_cursor::~ha_exasol_gw_cursor()
@@ -210,6 +269,7 @@ int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
 {
   try
   {
+    connection= &session->connection();
     initialize_column_kinds(table_arg);
     exasol_gw::SessionGwOpenCursorResult opened=
         connection->open_pushed_query(query_text ? std::string(query_text) : std::string());
@@ -221,10 +281,10 @@ int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
     end_of_cursor= false;
     return 0;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "opening EXASOL pushed-query cursor");
   }
 }
 
@@ -235,6 +295,7 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
 {
   try
   {
+    connection= &session->connection();
     const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
     exasol_gw::SessionGwOpenCursorResult opened=
         connection->open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns, include_row_handles);
@@ -246,10 +307,10 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
     end_of_cursor= false;
     return 0;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "opening EXASOL table-scan cursor");
   }
 }
 
@@ -260,6 +321,7 @@ int ha_exasol_gw_cursor::open_table_scan_by_row_handle(TABLE *table_arg,
 {
   try
   {
+    connection= &session->connection();
     const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
     exasol_gw::SessionGwOpenCursorResult opened=
         connection->open_table_scan(table_schema_name(table_arg),
@@ -275,10 +337,10 @@ int ha_exasol_gw_cursor::open_table_scan_by_row_handle(TABLE *table_arg,
     end_of_cursor= false;
     return 0;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "opening EXASOL positioned cursor");
   }
 }
 
@@ -300,10 +362,10 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
     }
     return HA_ERR_END_OF_FILE;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "fetching EXASOL cursor batch");
   }
 }
 
@@ -316,6 +378,7 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     return HA_ERR_END_OF_FILE;
   try
   {
+    DbugWriteSetGuard write_set_guard(table_arg);
     if (current_batch.columns.size() != selected_field_indices.size())
       throw std::runtime_error("SessionGW Arrow column count does not match projected MariaDB fields");
     for (std::size_t column= 0; column < selected_field_indices.size(); ++column)
@@ -338,10 +401,10 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     ++current_row;
     return 0;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "materializing EXASOL cursor row");
   }
 }
 
@@ -375,11 +438,11 @@ int ha_exasol_gw_cursor::close(char *error_buffer, unsigned long error_buffer_si
     }
     return 0;
   }
-  catch (const std::exception &ex)
+  catch (...)
   {
     cursor_id= 0;
-    copy_error(error_buffer, error_buffer_size, ex.what());
-    return HA_ERR_INTERNAL_ERROR;
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "closing EXASOL cursor");
   }
 }
 
@@ -388,56 +451,83 @@ int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *thd_arg,
                                                       const char *query_text,
                                                       bool)
 {
-  if (!query_generation_error.empty())
+  try
   {
-    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
-             query_generation_error.c_str());
-    return HA_ERR_INTERNAL_ERROR;
-  }
+    if (!query_generation_error.empty())
+    {
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+               query_generation_error.c_str());
+      return HA_ERR_INTERNAL_ERROR;
+    }
 
-  cursor= new ha_exasol_gw_cursor(thd_arg);
-  char error_buffer[512]= {0};
-  const int rc= cursor->open_pushed_query(table_arg, query_text, error_buffer, sizeof(error_buffer));
-  if (rc != 0)
+    cursor= new ha_exasol_gw_cursor(thd_arg);
+    if (!cursor)
+      return HA_ERR_OUT_OF_MEM;
+    char error_buffer[512]= {0};
+    const int rc= cursor->open_pushed_query(table_arg, query_text, error_buffer, sizeof(error_buffer));
+    if (rc != 0)
+    {
+      delete cursor;
+      cursor= nullptr;
+      my_error(ER_GET_ERRNO, MYF(0), rc,
+               error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW pushed query");
+    }
+    return rc;
+  }
+  catch (...)
   {
     delete cursor;
     cursor= nullptr;
-    my_error(ER_GET_ERRNO, MYF(0), rc,
-             error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW pushed query");
+    return report_pushdown_exception("starting EXASOL pushed-query scan");
   }
-  return rc;
 }
 
 int ha_exasol_gw_pushdown_handler_base::next_row_(TABLE *table_arg)
 {
-  if (!cursor)
-    return HA_ERR_END_OF_FILE;
-
-  char error_buffer[512]= {0};
-  const int rc= cursor->fetch_row(table_arg, table_arg->record[0], error_buffer, sizeof(error_buffer));
-  if (rc != 0 && rc != HA_ERR_END_OF_FILE)
+  try
   {
-    my_error(ER_GET_ERRNO, MYF(0), rc,
-             error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW row");
+    if (!cursor)
+      return HA_ERR_END_OF_FILE;
+
+    char error_buffer[512]= {0};
+    const int rc= cursor->fetch_row(table_arg, table_arg->record[0], error_buffer, sizeof(error_buffer));
+    if (rc != 0 && rc != HA_ERR_END_OF_FILE)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), rc,
+               error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW row");
+    }
+    return rc;
   }
-  return rc;
+  catch (...)
+  {
+    return report_pushdown_exception("fetching EXASOL pushed-query row");
+  }
 }
 
 int ha_exasol_gw_pushdown_handler_base::end_scan_()
 {
-  if (!cursor)
-    return 0;
-  char error_buffer[512]= {0};
-  const int rc= cursor->close(error_buffer, sizeof(error_buffer));
-  delete cursor;
-  cursor= nullptr;
-  if (rc != 0)
+  try
   {
-    my_error(ER_GET_ERRNO, MYF(0), rc,
-             error_buffer[0] ? error_buffer : "failed to close EXASOL SessionGW cursor");
-    return rc;
+    if (!cursor)
+      return 0;
+    char error_buffer[512]= {0};
+    const int rc= cursor->close(error_buffer, sizeof(error_buffer));
+    delete cursor;
+    cursor= nullptr;
+    if (rc != 0)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), rc,
+               error_buffer[0] ? error_buffer : "failed to close EXASOL SessionGW cursor");
+      return rc;
+    }
+    return 0;
   }
-  return 0;
+  catch (...)
+  {
+    delete cursor;
+    cursor= nullptr;
+    return report_pushdown_exception("ending EXASOL pushed-query scan");
+  }
 }
 
 ha_exasol_gw_derived_handler::ha_exasol_gw_derived_handler(THD *thd_arg,
@@ -508,20 +598,27 @@ ha_exasol_gw_select_handler::~ha_exasol_gw_select_handler()
 
 int ha_exasol_gw_select_handler::init_scan()
 {
-  if (uses_staged_distinct_pushdown)
+  try
   {
-    query.length(0);
-    query.append(STRING_WITH_LEN("SELECT DISTINCT * FROM ("));
-    query.append(stage_query.ptr(), stage_query.length());
-    query.append(STRING_WITH_LEN(") SGW_STAGE"));
-    if (staged_order_by.length() > 0)
+    if (uses_staged_distinct_pushdown)
     {
-      query.append(STRING_WITH_LEN(" ORDER BY "));
-      query.append(staged_order_by.ptr(), staged_order_by.length());
+      query.length(0);
+      query.append(STRING_WITH_LEN("SELECT DISTINCT * FROM ("));
+      query.append(stage_query.ptr(), stage_query.length());
+      query.append(STRING_WITH_LEN(") SGW_STAGE"));
+      if (staged_order_by.length() > 0)
+      {
+        query.append(STRING_WITH_LEN(" ORDER BY "));
+        query.append(staged_order_by.ptr(), staged_order_by.length());
+      }
     }
-  }
 
-  return init_scan_(thd, table, query.ptr(), false);
+    return init_scan_(thd, table, query.ptr(), false);
+  }
+  catch (...)
+  {
+    return report_pushdown_exception("initializing EXASOL SELECT pushdown");
+  }
 }
 
 int ha_exasol_gw_select_handler::next_row()

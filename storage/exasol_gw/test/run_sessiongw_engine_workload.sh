@@ -21,6 +21,7 @@ PERF_ROWS=${PERF_ROWS:-100000}
 PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
 PERF_UPDATE_ROWS=${PERF_UPDATE_ROWS:-$((PERF_ROWS / 10))}
 PERF_DELETE_ROWS=${PERF_DELETE_ROWS:-$((PERF_ROWS / 20))}
+FAULT_INJECTION_ONLY=${FAULT_INJECTION_ONLY:-0}
 if (( PERF_UPDATE_ROWS == 0 )); then PERF_UPDATE_ROWS=1; fi
 if (( PERF_DELETE_ROWS == 0 )); then PERF_DELETE_ROWS=1; fi
 
@@ -96,6 +97,23 @@ expect_failure() {
     log "PASS expected failure: $label"
 }
 
+expect_failure_contains() {
+    local label=$1
+    local sql=$2
+    local expected=$3
+    local output="$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out"
+    if mysql -e "$sql" >"$output" 2>&1; then
+        echo "Expected failure for $label but command succeeded" >&2
+        exit 1
+    fi
+    if ! grep -Fq "$expected" "$output"; then
+        echo "Failure for $label did not contain '$expected'" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+    log "PASS contained exception: $label"
+}
+
 expect_exasol_failure() {
     local label=$1
     local sql=$2
@@ -169,6 +187,30 @@ SELECT * FROM T ORDER BY ID;
 SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
 SQL
 log "PASS ddl insert update delete scan"
+
+if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
+    expect_failure_contains "cursor constructor allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_cursor_constructor_oom'; USE $SCHEMA; SELECT * FROM T" \
+        "out of memory"
+    expect_failure_contains "insert context constructor allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_insert_context_constructor_oom'; USE $SCHEMA; INSERT INTO T VALUES (10, 'fault')" \
+        "out of memory"
+    expect_failure_contains "update context constructor allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_update_context_constructor_oom'; USE $SCHEMA; UPDATE T SET NAME='fault' WHERE ID=1" \
+        "out of memory"
+    expect_failure_contains "delete context constructor allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_delete_context_constructor_oom'; USE $SCHEMA; DELETE FROM T WHERE ID=1" \
+        "out of memory"
+    expect_scalar "constructor faults preserve server and rows" \
+        "USE $SCHEMA; SELECT CONCAT(COUNT(*), '|', MIN(NAME)) FROM T" "3|Alice"
+else
+    log "SKIP constructor fault injection (MariaDB build has DBUG disabled)"
+fi
+
+if [[ "$FAULT_INJECTION_ONLY" == "1" ]]; then
+    log "SessionGW MariaDB constructor fault-injection workload passed"
+    exit 0
+fi
 
 mysql --table <<SQL | tee -a "$REPORT"
 USE $SCHEMA;
