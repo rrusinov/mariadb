@@ -6,7 +6,7 @@
 #include "select_handler.h"
 
 #include "exasol_arrow_ipc.h"
-#include "exasol_sessiongw_client.h"
+#include "exasol_gw_session.h"
 
 #include <memory>
 #include <string>
@@ -17,7 +17,7 @@ class ha_exasol_gw;
 class ha_exasol_gw_cursor
 {
 public:
-  ha_exasol_gw_cursor();
+  explicit ha_exasol_gw_cursor(THD *thd_arg);
   ~ha_exasol_gw_cursor();
 
   int open_pushed_query(TABLE *table_arg, const char *query_text, char *error_buffer,
@@ -38,14 +38,18 @@ private:
   int materialize_current_row(TABLE *table_arg, unsigned char *record, char *error_buffer,
                               unsigned long error_buffer_size);
   void initialize_column_kinds(TABLE *table_arg);
+  std::vector<std::string> initialize_table_scan_columns(TABLE *table_arg);
 
+  exasol_gw::SessionGwThdContext *session;
+  exasol_gw::SessionGwConnection *connection;
   exasol_gw::SessionGwOptions options;
-  exasol_gw::SessionGwConnection connection;
   std::uint64_t cursor_id;
+  bool cursor_registered;
   exasol_gw::ArrowRowBatch current_batch;
   std::size_t current_row;
   bool end_of_cursor;
   std::vector<exasol_gw::ArrowColumnKind> column_kinds;
+  std::vector<std::size_t> selected_field_indices;
   std::vector<exasol_gw::SessionGwRowHandle> current_row_handles;
   exasol_gw::SessionGwRowHandle last_row_handle_;
 };

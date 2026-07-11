@@ -96,6 +96,16 @@ expect_failure() {
     log "PASS expected failure: $label"
 }
 
+expect_exasol_failure() {
+    local label=$1
+    local sql=$2
+    if sql_exasol "$sql" >"$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out" 2>&1; then
+        echo "Expected Exasol failure for $label but command succeeded" >&2
+        exit 1
+    fi
+    log "PASS expected Exasol failure: $label"
+}
+
 log "SessionGW MariaDB engine workload"
 log "base=$BASE_DIR"
 log "mariadb_build=$MARIADB_BUILD"
@@ -181,8 +191,56 @@ expect_scalar "prepared statement count" \
 
 expect_failure "unsupported key definition" \
     "USE $SCHEMA; CREATE TABLE BAD_KEY(ID INT, KEY(ID)) ENGINE=EXASOL"
+expect_failure "unsupported default clause" \
+    "USE $SCHEMA; CREATE TABLE BAD_DEFAULT(ID INT DEFAULT 1) ENGINE=EXASOL"
+expect_failure "unsupported auto increment" \
+    "USE $SCHEMA; CREATE TABLE BAD_AUTO(ID INT AUTO_INCREMENT PRIMARY KEY) ENGINE=EXASOL"
+expect_failure "unsupported binary string" \
+    "USE $SCHEMA; CREATE TABLE BAD_BINARY(B BINARY(8)) ENGINE=EXASOL"
+expect_failure "unsupported multi-bit value" \
+    "USE $SCHEMA; CREATE TABLE BAD_BIT(B BIT(2)) ENGINE=EXASOL"
+expect_failure "unsupported explicit table charset" \
+    "USE $SCHEMA; CREATE TABLE BAD_CHARSET(V VARCHAR(8)) ENGINE=EXASOL DEFAULT CHARSET=latin1"
 expect_failure "unsupported alter table" \
     "USE $SCHEMA; ALTER TABLE T ADD COLUMN EXTRA INT"
+expect_failure "unsupported truncate table" \
+    "USE $SCHEMA; TRUNCATE TABLE T"
+expect_failure "unsupported rename table" \
+    "USE $SCHEMA; RENAME TABLE T TO T_RENAMED"
+expect_scalar "rejected DDL preserved table rows" "USE $SCHEMA; SELECT COUNT(*) FROM T" "3"
+REJECTED_TABLES=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA' and table_name like 'BAD_%'")
+echo "$REJECTED_TABLES" | grep -q '"data":\[\[0\]\]'
+log "PASS rejected DDL did not mutate Exasol"
+
+sql_exasol "CREATE TABLE $SCHEMA.REMOTE_GUARD(ID DECIMAL(18,0) NOT NULL)" >/dev/null
+sql_exasol "INSERT INTO $SCHEMA.REMOTE_GUARD VALUES 42" >/dev/null
+expect_failure "existing remote table is preserved" \
+    "USE $SCHEMA; CREATE TABLE REMOTE_GUARD(ID BIGINT NOT NULL) ENGINE=EXASOL"
+REMOTE_GUARD=$(sql_exasol "select count(*), min(id) from $SCHEMA.REMOTE_GUARD")
+echo "$REMOTE_GUARD" | tee -a "$REPORT" | grep -Eq '"data":\[\[1\],\["?42"?\]\]'
+log "PASS existing remote table contents preserved"
+
+mysql -e "USE $SCHEMA; CREATE TABLE NULLABILITY_GUARD(REQUIRED_ID INT NOT NULL, OPTIONAL_NAME VARCHAR(8) NULL) ENGINE=EXASOL"
+expect_exasol_failure "remote not null enforcement" \
+    "INSERT INTO $SCHEMA.NULLABILITY_GUARD VALUES (NULL, NULL)"
+sql_exasol "INSERT INTO $SCHEMA.NULLABILITY_GUARD VALUES (1, NULL)" >/dev/null
+expect_scalar "nullable column mapping" \
+    "USE $SCHEMA; SELECT COUNT(*) FROM NULLABILITY_GUARD WHERE OPTIONAL_NAME IS NULL" "1"
+log "PASS nullability mapped to Exasol"
+
+mysql -e "USE $SCHEMA; CREATE TABLE ABORT_GUARD(ID INT, NAME VARCHAR(8) NULL) ENGINE=EXASOL"
+sql_exasol "DROP TABLE $SCHEMA.ABORT_GUARD" >/dev/null
+sql_exasol "CREATE TABLE $SCHEMA.ABORT_GUARD(ID DECIMAL(18,0), NAME VARCHAR(8) UTF8 NOT NULL)" >/dev/null
+sql_exasol "INSERT INTO $SCHEMA.ABORT_GUARD VALUES (1, 'before')" >/dev/null
+expect_failure "failed insert aborts accepted prefix" \
+    "USE $SCHEMA; INSERT INTO ABORT_GUARD VALUES (2, 'valid'), (3, NULL)"
+ABORT_INSERT_STATE=$(sql_exasol "select count(*), sum(id) from $SCHEMA.ABORT_GUARD")
+echo "$ABORT_INSERT_STATE" | tee -a "$REPORT" | grep -Eq '"data":\[\[1\],\["?1"?\]\]'
+expect_failure "failed update aborts accepted prefix" \
+    "USE $SCHEMA; UPDATE ABORT_GUARD SET NAME=CASE WHEN ID=1 THEN NULL ELSE 'changed' END"
+ABORT_UPDATE_STATE=$(sql_exasol "select count(*), min(name) from $SCHEMA.ABORT_GUARD")
+echo "$ABORT_UPDATE_STATE" | tee -a "$REPORT" | grep -q '"data":\[\[1\],\["before"\]\]'
+log "PASS failed DML left no committed prefix"
 
 mysql --table <<SQL | tee -a "$REPORT"
 USE $SCHEMA;
@@ -311,7 +369,8 @@ DIRECT=$(sql_exasol "select count(*), sum(id), count(case when name like 'Name_%
 echo "$DIRECT" | tee -a "$REPORT" >/dev/null
 log "PASS direct Exasol final verification"
 
-mysql -e "USE $SCHEMA; DROP TABLE T" >/dev/null
+sql_exasol "DROP TABLE $SCHEMA.REMOTE_GUARD" >/dev/null
+mysql -e "USE $SCHEMA; DROP TABLE ABORT_GUARD; DROP TABLE NULLABILITY_GUARD; DROP TABLE T" >/dev/null
 ABSENT=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA' and table_name='T'")
 echo "$ABSENT" | grep -q '"data":\[\[0\]\]'
 log "PASS drop table removed backing Exasol table"

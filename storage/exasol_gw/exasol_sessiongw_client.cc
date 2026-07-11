@@ -484,6 +484,7 @@ public:
     connect_and_login(options);
     send_text("{\"command\":\"enterSessionGateway\",\"protocolVersion\":1}");
     require_status_ok(receive_text());
+    session_gateway_entered_= true;
     send_frame(SessionGwMessageType::hello, {});
     SessionGwFrame hello= receive_frame();
     throw_if_error_frame(hello);
@@ -500,7 +501,7 @@ public:
 
   void close()
   {
-    if (fd_ >= 0)
+    if (fd_ >= 0 && session_gateway_entered_)
     {
       try
       {
@@ -526,6 +527,7 @@ public:
       ::close(fd_);
       fd_= -1;
     }
+    session_gateway_entered_= false;
   }
 
   SessionGwDescribeTableResult describe_table(const std::string &schema, const std::string &table)
@@ -997,6 +999,7 @@ private:
   SSL_CTX *ssl_ctx_= nullptr;
   SSL *ssl_= nullptr;
   std::uint64_t request_id_= 1;
+  bool session_gateway_entered_= false;
 };
 
 SessionGwConnection::SessionGwConnection(): impl_(new Impl()) {}

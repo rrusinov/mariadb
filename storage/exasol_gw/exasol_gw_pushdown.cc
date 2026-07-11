@@ -134,9 +134,12 @@ exasol_gw::ArrowColumnKind kind_for_field(Field *field)
 
 } // namespace
 
-ha_exasol_gw_cursor::ha_exasol_gw_cursor()
-  : options(exasol_gw::options_from_environment()),
+ha_exasol_gw_cursor::ha_exasol_gw_cursor(THD *thd_arg)
+  : session(&exasol_gw::session_for_thd(thd_arg)),
+    connection(&session->connection()),
+    options(exasol_gw::options_from_environment()),
     cursor_id(0),
+    cursor_registered(false),
     current_row(0),
     end_of_cursor(false)
 {
@@ -151,10 +154,53 @@ ha_exasol_gw_cursor::~ha_exasol_gw_cursor()
 void ha_exasol_gw_cursor::initialize_column_kinds(TABLE *table_arg)
 {
   column_kinds.clear();
+  selected_field_indices.clear();
   if (!table_arg)
     return;
-  for (Field **field= table_arg->field; *field; ++field)
+  std::size_t field_index= 0;
+  for (Field **field= table_arg->field; *field; ++field, ++field_index)
+  {
     column_kinds.push_back(kind_for_field(*field));
+    selected_field_indices.push_back(field_index);
+  }
+}
+
+std::vector<std::string> ha_exasol_gw_cursor::initialize_table_scan_columns(TABLE *table_arg)
+{
+  column_kinds.clear();
+  selected_field_indices.clear();
+  std::vector<std::string> columns;
+  if (!table_arg)
+    return columns;
+  bool full_row_required= false;
+  if (table_arg->write_set)
+  {
+    for (Field **field= table_arg->field; *field; ++field)
+    {
+      if (bitmap_is_set(table_arg->write_set, (*field)->field_index))
+      {
+        full_row_required= true;
+        break;
+      }
+    }
+  }
+  std::size_t field_index= 0;
+  for (Field **field= table_arg->field; *field; ++field, ++field_index)
+  {
+    if (!full_row_required && table_arg->read_set &&
+        !bitmap_is_set(table_arg->read_set, (*field)->field_index))
+      continue;
+    columns.push_back(field_name(*field));
+    column_kinds.push_back(kind_for_field(*field));
+    selected_field_indices.push_back(field_index);
+  }
+  if (columns.empty() && table_arg->field[0])
+  {
+    columns.push_back(field_name(table_arg->field[0]));
+    column_kinds.push_back(kind_for_field(table_arg->field[0]));
+    selected_field_indices.push_back(0);
+  }
+  return columns;
 }
 
 int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
@@ -165,10 +211,11 @@ int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
   try
   {
     initialize_column_kinds(table_arg);
-    connection.connect_and_enter(options);
     exasol_gw::SessionGwOpenCursorResult opened=
-        connection.open_pushed_query(query_text ? std::string(query_text) : std::string());
+        connection->open_pushed_query(query_text ? std::string(query_text) : std::string());
     cursor_id= opened.cursor_id;
+    session->read_cursor_opened();
+    cursor_registered= true;
     current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
     end_of_cursor= false;
@@ -188,14 +235,12 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
 {
   try
   {
-    initialize_column_kinds(table_arg);
-    std::vector<std::string> columns;
-    for (Field **field= table_arg->field; *field; ++field)
-      columns.push_back(field_name(*field));
-    connection.connect_and_enter(options);
+    const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
     exasol_gw::SessionGwOpenCursorResult opened=
-        connection.open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns, include_row_handles);
+        connection->open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns, include_row_handles);
     cursor_id= opened.cursor_id;
+    session->read_cursor_opened();
+    cursor_registered= true;
     current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
     end_of_cursor= false;
@@ -215,18 +260,16 @@ int ha_exasol_gw_cursor::open_table_scan_by_row_handle(TABLE *table_arg,
 {
   try
   {
-    initialize_column_kinds(table_arg);
-    std::vector<std::string> columns;
-    for (Field **field= table_arg->field; *field; ++field)
-      columns.push_back(field_name(*field));
-    connection.connect_and_enter(options);
+    const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
     exasol_gw::SessionGwOpenCursorResult opened=
-        connection.open_table_scan(table_schema_name(table_arg),
+        connection->open_table_scan(table_schema_name(table_arg),
                                    table_object_name(table_arg),
                                    columns,
                                    false,
                                    {row_handle});
     cursor_id= opened.cursor_id;
+    session->read_cursor_opened();
+    cursor_registered= true;
     current_batch= exasol_gw::ArrowRowBatch();
     current_row= 0;
     end_of_cursor= false;
@@ -245,7 +288,7 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
   {
     while (!end_of_cursor)
     {
-      exasol_gw::SessionGwFetchResult fetched= connection.fetch(cursor_id, options.fetch_rows, 0);
+      exasol_gw::SessionGwFetchResult fetched= connection->fetch(cursor_id, options.fetch_rows, 0);
       end_of_cursor= fetched.end_of_cursor;
       current_batch= exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
       current_row_handles= fetched.row_handles;
@@ -273,21 +316,21 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     return HA_ERR_END_OF_FILE;
   try
   {
-    std::size_t column= 0;
-    for (Field **field= table_arg->field; *field; ++field, ++column)
+    if (current_batch.columns.size() != selected_field_indices.size())
+      throw std::runtime_error("SessionGW Arrow column count does not match projected MariaDB fields");
+    for (std::size_t column= 0; column < selected_field_indices.size(); ++column)
     {
-      if (column >= current_batch.columns.size())
-        throw std::runtime_error("SessionGW Arrow column count does not match MariaDB table");
+      Field *field= table_arg->field[selected_field_indices[column]];
       const exasol_gw::ArrowCell &cell= current_batch.columns[column][current_row];
       if (cell.is_null)
       {
-        (*field)->set_null();
+        field->set_null();
       }
       else
       {
-        (*field)->set_notnull();
-        const std::string value= cell_value_for_field(*field, cell);
-        (*field)->store(value.data(), value.size(), &my_charset_bin);
+        field->set_notnull();
+        const std::string value= cell_value_for_field(field, cell);
+        field->store(value.data(), value.size(), &my_charset_bin);
       }
     }
     if (current_row < current_row_handles.size())
@@ -322,10 +365,14 @@ int ha_exasol_gw_cursor::close(char *error_buffer, unsigned long error_buffer_si
   {
     if (cursor_id != 0)
     {
-      connection.close_cursor(cursor_id);
+      connection->close_cursor(cursor_id);
       cursor_id= 0;
     }
-    connection.close();
+    if (cursor_registered)
+    {
+      cursor_registered= false;
+      session->read_cursor_closed();
+    }
     return 0;
   }
   catch (const std::exception &ex)
@@ -336,7 +383,7 @@ int ha_exasol_gw_cursor::close(char *error_buffer, unsigned long error_buffer_si
   }
 }
 
-int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *,
+int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *thd_arg,
                                                       TABLE *table_arg,
                                                       const char *query_text,
                                                       bool)
@@ -348,7 +395,7 @@ int ha_exasol_gw_pushdown_handler_base::init_scan_(THD *,
     return HA_ERR_INTERNAL_ERROR;
   }
 
-  cursor= new ha_exasol_gw_cursor();
+  cursor= new ha_exasol_gw_cursor(thd_arg);
   char error_buffer[512]= {0};
   const int rc= cursor->open_pushed_query(table_arg, query_text, error_buffer, sizeof(error_buffer));
   if (rc != 0)

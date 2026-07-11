@@ -5,6 +5,7 @@
 
 #include "handler.h"
 #include "table.h"
+#include "sql_alter.h"
 #include "sql_class.h"
 #include "sql_lex.h"
 #include "sql_select.h"
@@ -38,7 +39,10 @@ struct InsertContext;
 struct UpdateContext;
 struct DeleteContext;
 exasol_gw::SessionGwRowHandle row_handle_from_ref(const uchar *ref);
-std::string create_table_sql(TABLE *form);
+std::string table_schema_name(TABLE *table);
+std::string quote_exasol_identifier(const std::string &identifier);
+bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
+                            std::string *sql, std::string *error);
 std::string drop_table_sql_from_path(const char *from);
 }
 
@@ -117,22 +121,31 @@ public:
     return rnd_end();
   }
 
-  int create(const char *, TABLE *form, HA_CREATE_INFO *) override
+  int create(const char *, TABLE *form, HA_CREATE_INFO *create_info) override
   {
+    const int sql_command= thd_sql_command(ha_thd());
+    if (sql_command == SQLCOM_ALTER_TABLE || sql_command == SQLCOM_TRUNCATE)
+    {
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
+               "ALTER and TRUNCATE are not supported for EXASOL tables");
+      return HA_ERR_UNSUPPORTED;
+    }
+
+    std::string table_sql;
+    std::string error;
+    if (!build_create_table_sql(form, create_info, &table_sql, &error))
+    {
+      my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED, error.c_str());
+      return HA_ERR_UNSUPPORTED;
+    }
+
     try
     {
       exasol_gw::SessionGwOptions options= exasol_gw::options_from_environment();
-      const std::string ddl= create_table_sql(form);
-      const std::size_t separator= ddl.find(';');
-      if (separator != std::string::npos)
-      {
-        exasol_gw::execute_sql(options, ddl.substr(0, separator));
-        exasol_gw::execute_sql(options, ddl.substr(separator + 1));
-      }
-      else
-      {
-        exasol_gw::execute_sql(options, ddl);
-      }
+      exasol_gw::execute_sql(options,
+                             "CREATE SCHEMA IF NOT EXISTS " +
+                                 quote_exasol_identifier(table_schema_name(form)));
+      exasol_gw::execute_sql(options, table_sql);
       return 0;
     }
     catch (const std::exception &ex)
@@ -156,6 +169,20 @@ public:
     }
   }
 
+  int truncate() override
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
+             "TRUNCATE TABLE is not supported for EXASOL tables");
+    return HA_ERR_UNSUPPORTED;
+  }
+
+  int rename_table(const char *, const char *) override
+  {
+    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_UNSUPPORTED,
+             "RENAME TABLE is not supported for EXASOL tables");
+    return HA_ERR_UNSUPPORTED;
+  }
+
   void start_bulk_insert(ha_rows rows, uint flags) override;
   int end_bulk_insert() override;
   int write_row(const uchar *) override;
@@ -166,7 +193,7 @@ public:
   {
     (void) rnd_end();
     have_positioned_row_handle= false;
-    cursor= new ha_exasol_gw_cursor();
+    cursor= new ha_exasol_gw_cursor(table->in_use);
     char error_buffer[512]= {0};
     const int rc= cursor->open_table_scan(table, error_buffer, sizeof(error_buffer), true);
     if (rc != 0)
@@ -212,7 +239,7 @@ public:
   int rnd_pos(uchar *buf, uchar *pos) override
   {
     const exasol_gw::SessionGwRowHandle row_handle= row_handle_from_ref(pos);
-    ha_exasol_gw_cursor positioned_cursor;
+    ha_exasol_gw_cursor positioned_cursor(table->in_use);
     char error_buffer[512]= {0};
     const int open_rc= positioned_cursor.open_table_scan_by_row_handle(table,
                                                                        row_handle,
@@ -348,70 +375,185 @@ std::string quote_exasol_identifier(const std::string &identifier)
   return quoted;
 }
 
-std::string exasol_type_for_field(Field *field)
+enum_field_types declared_field_type(Field *field, Create_field *create_field)
 {
-  switch (field->type())
+  return create_field ? create_field->type_handler()->field_type() : field->real_type();
+}
+
+bool declared_field_is_unsigned(Field *field, Create_field *create_field)
+{
+  return create_field ? (create_field->flags & UNSIGNED_FLAG) != 0 : field->is_unsigned();
+}
+
+uint declared_field_char_length(Field *field, Create_field *create_field)
+{
+  return create_field ? create_field->char_length : field->char_length();
+}
+
+CHARSET_INFO *declared_field_charset(Field *field, Create_field *create_field)
+{
+  return create_field && create_field->charset ? create_field->charset : field->charset();
+}
+
+bool append_exasol_type(Field *field, Create_field *create_field,
+                        std::string *sql, std::string *error)
+{
+  const enum_field_types type= declared_field_type(field, create_field);
+  const bool is_unsigned= declared_field_is_unsigned(field, create_field);
+  switch (type)
   {
   case MYSQL_TYPE_TINY:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(3,0)" : "DECIMAL(3,0)";
+    *sql += "DECIMAL(3,0)";
+    return true;
   case MYSQL_TYPE_SHORT:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(5,0)" : "DECIMAL(9,0)";
+    *sql += is_unsigned ? "DECIMAL(5,0)" : "DECIMAL(9,0)";
+    return true;
   case MYSQL_TYPE_INT24:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(8,0)" : "DECIMAL(9,0)";
+    *sql += is_unsigned ? "DECIMAL(8,0)" : "DECIMAL(9,0)";
+    return true;
   case MYSQL_TYPE_LONG:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(10,0)" : "DECIMAL(18,0)";
+    *sql += is_unsigned ? "DECIMAL(10,0)" : "DECIMAL(18,0)";
+    return true;
   case MYSQL_TYPE_LONGLONG:
-    return (field->flags & UNSIGNED_FLAG) ? "DECIMAL(18,0)" : "DECIMAL(18,0)";
+    if (is_unsigned)
+    {
+      *error= "unsigned BIGINT is not supported for EXASOL field '" + field_name(field) + "'";
+      return false;
+    }
+    *sql += "DECIMAL(18,0)";
+    return true;
   case MYSQL_TYPE_YEAR:
-    return "DECIMAL(4,0)";
+    *sql += "DECIMAL(4,0)";
+    return true;
   case MYSQL_TYPE_FLOAT:
   case MYSQL_TYPE_DOUBLE:
-    return "DOUBLE PRECISION";
+    *sql += "DOUBLE PRECISION";
+    return true;
   case MYSQL_TYPE_DECIMAL:
   case MYSQL_TYPE_NEWDECIMAL:
   {
     const uint scale= field->decimals();
-    const uint precision= std::max<uint>(scale + 1U, std::min<uint>(36U, field->field_length));
-    return "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+    const uint precision= field->real_type() == MYSQL_TYPE_NEWDECIMAL
+                              ? static_cast<Field_new_decimal *>(field)->precision
+                              : my_decimal_length_to_precision(field->field_length, scale,
+                                                               field->is_unsigned());
+    if (precision == 0 || precision > 36 || scale > precision)
+    {
+      *error= "unsupported DECIMAL precision for EXASOL field '" + field_name(field) + "'";
+      return false;
+    }
+    *sql += "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+    return true;
   }
   case MYSQL_TYPE_DATE:
   case MYSQL_TYPE_NEWDATE:
-    return "DATE";
+    *sql += "DATE";
+    return true;
   case MYSQL_TYPE_DATETIME:
   case MYSQL_TYPE_DATETIME2:
   case MYSQL_TYPE_TIMESTAMP:
   case MYSQL_TYPE_TIMESTAMP2:
-    return "TIMESTAMP(6)";
+    *sql += "TIMESTAMP(" + std::to_string(field->decimals()) + ")";
+    return true;
   case MYSQL_TYPE_BIT:
-    return "BOOLEAN";
-  default:
+    if (field->field_length == 1)
+    {
+      *sql += "BOOLEAN";
+      return true;
+    }
+    break;
+  case MYSQL_TYPE_STRING:
+  case MYSQL_TYPE_VAR_STRING:
+  case MYSQL_TYPE_VARCHAR:
   {
-    const uint length= std::max<uint>(1, field->char_length());
-    if (field->type() == MYSQL_TYPE_STRING)
-      return "CHAR(" + std::to_string(length) + ") UTF8";
-    return "VARCHAR(" + std::to_string(length) + ") UTF8";
+    if (declared_field_charset(field, create_field) == &my_charset_bin)
+    {
+      *error= "binary strings are not supported for EXASOL field '" + field_name(field) + "'";
+      return false;
+    }
+    const uint length= declared_field_char_length(field, create_field);
+    if (length == 0 || length > 2000000U)
+      break;
+    *sql += type == MYSQL_TYPE_STRING ? "CHAR(" : "VARCHAR(";
+    *sql += std::to_string(length) + ") UTF8";
+    return true;
   }
+  default:
+    break;
   }
+  *error= "unsupported MariaDB type for EXASOL field '" + field_name(field) + "'";
+  return false;
 }
 
-std::string create_table_sql(TABLE *form)
+bool validate_create_options(HA_CREATE_INFO *create_info, std::string *error)
 {
+  if (!create_info || !create_info->alter_info)
+    return true;
+  Alter_info *alter_info= create_info->alter_info;
+  if (alter_info->key_list.elements != 0 || alter_info->check_constraint_list.elements != 0)
+  {
+    *error= "indexes and table constraints are not supported for EXASOL tables";
+    return false;
+  }
+  if ((create_info->used_fields & ~(HA_CREATE_USED_ENGINE)) != 0 ||
+      create_info->versioned() || create_info->tmp_table() || alter_info->num_parts != 0)
+  {
+    *error= "the requested MariaDB table options are not supported for EXASOL tables";
+    return false;
+  }
+
+  List_iterator_fast<Create_field> fields(alter_info->create_list);
+  while (Create_field *field= fields++)
+  {
+    if (field->default_value || field->on_update || field->vcol_info || field->check_constraint ||
+        (field->flags & AUTO_INCREMENT_FLAG) != 0 || field->comment.length != 0 ||
+        field->option_list || field->invisible != VISIBLE ||
+        field->versioning != Column_definition::VERSIONING_NOT_SET || field->period)
+    {
+      *error= "unsupported clause for EXASOL field '" +
+              std::string(field->field_name.str, field->field_name.length) + "'";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
+                            std::string *sql, std::string *error)
+{
+  if (!form || !sql || !error)
+    return false;
+  if (!validate_create_options(create_info, error))
+    return false;
+
   const std::string schema= table_schema_name(form);
   const std::string object= table_object_name(form);
-  std::string sql= "CREATE SCHEMA IF NOT EXISTS " + quote_exasol_identifier(schema) + "; CREATE OR REPLACE TABLE " +
-                   quote_exasol_identifier(schema) + "." + quote_exasol_identifier(object) + " (";
+  *sql= "CREATE TABLE " + quote_exasol_identifier(schema) + "." +
+        quote_exasol_identifier(object) + " (";
+  List<Create_field> empty_fields;
+  List_iterator_fast<Create_field> create_fields(
+      create_info && create_info->alter_info ? create_info->alter_info->create_list : empty_fields);
+  const bool have_create_fields= create_info && create_info->alter_info;
   bool first= true;
   for (Field **field= form->field; *field; ++field)
   {
+    Create_field *create_field= have_create_fields ? create_fields++ : nullptr;
+    if (create_field && field_name(*field) !=
+                            std::string(create_field->field_name.str, create_field->field_name.length))
+    {
+      *error= "MariaDB field metadata does not match the EXASOL table definition";
+      return false;
+    }
     if (!first)
-      sql += ", ";
+      *sql += ", ";
     first= false;
-    sql += quote_exasol_identifier(field_name(*field));
-    sql += " ";
-    sql += exasol_type_for_field(*field);
+    *sql += quote_exasol_identifier(field_name(*field)) + " ";
+    if (!append_exasol_type(*field, create_field, sql, error))
+      return false;
+    *sql += ((*field)->flags & NOT_NULL_FLAG) != 0 ? " NOT NULL" : " NULL";
   }
-  sql += ")";
-  return sql;
+  *sql += ")";
+  return true;
 }
 
 std::string drop_table_sql_from_path(const char *from)
@@ -696,21 +838,26 @@ std::uint32_t delete_batch_rows_from_environment()
   return batch_rows_from_environment("EXASOL_SESSIONGW_DELETE_BATCH_ROWS");
 }
 
-bool is_transaction_collision(const std::string &message)
+bool is_retryable_insert_failure(const std::string &message)
 {
   return message.find("Transaction collision") != std::string::npos ||
-         message.find("GlobalTransactionRollback") != std::string::npos;
+         message.find("GlobalTransactionRollback") != std::string::npos ||
+         message.find("unexpected eof") != std::string::npos ||
+         message.find("socket closed") != std::string::npos ||
+         message.find("WebSocket close received") != std::string::npos;
 }
 
 struct InsertContext
 {
-  explicit InsertContext(std::uint32_t max_rows): max_rows_per_batch(max_rows) {}
+  InsertContext(std::uint32_t max_rows, THD *thd)
+    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
+      max_rows_per_batch(max_rows) {}
 
   int append(TABLE *table)
   {
     try
     {
-      ensure_open(table);
+      ensure_operation_open(table);
       if (pending_columns.empty())
       {
         for (Field **field= table->field; *field; ++field)
@@ -724,7 +871,10 @@ struct InsertContext
       for (Field **field= table->field; *field; ++field, ++column_index)
       {
         if (!append_field_to_column_buffer(pending_columns[column_index], *field))
+        {
+          abort();
           return HA_ERR_UNSUPPORTED;
+        }
       }
       ++pending_rows;
       if (pending_rows >= max_rows_per_batch)
@@ -733,6 +883,7 @@ struct InsertContext
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -740,18 +891,18 @@ struct InsertContext
 
   int close(TABLE *table)
   {
+    if (failed)
+      return 0;
     try
     {
-      int rc= flush(table);
-      const int close_rc= close_operation();
-      connection.close();
-      connected= false;
+      const int rc= flush(table);
       if (rc != 0)
         return rc;
-      return close_rc;
+      return close_operation();
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -759,40 +910,45 @@ struct InsertContext
 
   void ensure_open(TABLE *table)
   {
-    if (connected)
+    if (initialized)
       return;
-    options= exasol_gw::options_from_environment();
-    connection.connect_and_enter(options);
-    connected= true;
     schema= table_schema_name(table);
     object= table_object_name(table);
     columns= table_column_names(table);
-    described= connection.describe_table(schema, object);
+    described= connection->describe_table(schema, object);
+    initialized= true;
   }
 
   int flush(TABLE *table)
   {
-    if (pending_rows == 0)
+    if (failed || pending_rows == 0)
       return 0;
     std::vector<std::uint8_t> batch;
     if (!build_native_batch_from_columns(pending_columns, pending_rows, &batch))
+    {
+      abort();
       return HA_ERR_UNSUPPORTED;
+    }
 
     try
     {
       ensure_operation_open(table);
-      const std::uint64_t affected= connection.insert_rows(operation_id, pending_rows, batch);
+      const std::uint64_t affected= connection->insert_rows(operation_id, pending_rows, batch);
       if (affected != pending_rows)
+      {
+        abort();
         return HA_ERR_INTERNAL_ERROR;
-      remember_sent_batch(batch, pending_rows);
+      }
+      ++successful_batches;
       reset_pending();
       return 0;
     }
     catch (const std::exception &ex)
     {
       const std::string error= ex.what();
-      if (successful_batches == 0 && is_transaction_collision(error))
+      if (successful_batches == 0 && is_retryable_insert_failure(error))
         return retry_pending_first_batch(table, batch, pending_rows, error);
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.c_str());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -811,10 +967,13 @@ struct InsertContext
       try
       {
         ensure_operation_open(table);
-        const std::uint64_t affected= connection.insert_rows(operation_id, rows, batch);
+        const std::uint64_t affected= connection->insert_rows(operation_id, rows, batch);
         if (affected != rows)
+        {
+          abort();
           return HA_ERR_INTERNAL_ERROR;
-        remember_sent_batch(batch, rows);
+        }
+        ++successful_batches;
         reset_pending();
         return 0;
       }
@@ -822,23 +981,27 @@ struct InsertContext
       {
         last_error= ex.what();
         reset_operation_after_error();
-        if (!is_transaction_collision(last_error))
+        if (!is_retryable_insert_failure(last_error))
           break;
       }
     }
+    abort();
     my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, last_error.c_str());
     return HA_ERR_INTERNAL_ERROR;
   }
 
   void ensure_operation_open(TABLE *table)
   {
+    if (!connection)
+      connection= &session->connection();
     ensure_open(table);
     if (operation_open)
       return;
     const exasol_gw::SessionGwOpenOperationResult opened=
-        connection.open_table_insert(schema, object, columns, max_rows_per_batch, described.arrow_schema);
+        connection->open_table_insert(schema, object, columns, max_rows_per_batch, described.arrow_schema);
     operation_id= opened.operation_id;
     operation_open= true;
+    session->operation_opened();
   }
 
   int close_operation()
@@ -847,92 +1010,39 @@ struct InsertContext
       return 0;
     try
     {
-      connection.close_operation(operation_id);
+      connection->close_operation(operation_id);
       operation_open= false;
       operation_id= 0;
-      clear_replay_batch();
+      successful_batches= 0;
+      session->operation_closed();
       return 0;
     }
-    catch (const std::exception &ex)
+    catch (...)
     {
-      const std::string error= ex.what();
-      if (successful_batches == 1 && !replay_batch.empty() && is_transaction_collision(error))
-        return retry_single_sent_batch(error);
+      abort();
       throw;
     }
   }
 
-  int retry_single_sent_batch(std::string last_error)
-  {
-    reset_operation_after_error();
-    constexpr int max_attempts= 8;
-    for (int attempt= 1; attempt < max_attempts; ++attempt)
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(25 * attempt));
-      try
-      {
-        ensure_operation_open_for_replay();
-        const std::uint64_t affected= connection.insert_rows(operation_id, replay_rows, replay_batch);
-        if (affected != replay_rows)
-          return HA_ERR_INTERNAL_ERROR;
-        connection.close_operation(operation_id);
-        operation_open= false;
-        operation_id= 0;
-        clear_replay_batch();
-        return 0;
-      }
-      catch (const std::exception &ex)
-      {
-        last_error= ex.what();
-        reset_operation_after_error();
-        if (!is_transaction_collision(last_error))
-          break;
-      }
-    }
-    my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, last_error.c_str());
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
-  void ensure_operation_open_for_replay()
-  {
-    if (!connected)
-    {
-      connection.connect_and_enter(options);
-      connected= true;
-    }
-    const exasol_gw::SessionGwOpenOperationResult opened=
-        connection.open_table_insert(schema, object, columns, max_rows_per_batch, described.arrow_schema);
-    operation_id= opened.operation_id;
-    operation_open= true;
-  }
-
   void reset_operation_after_error()
   {
-    connection.close();
-    connected= false;
+    session->reset();
+    connection= nullptr;
     operation_open= false;
     operation_id= 0;
   }
 
-  void remember_sent_batch(const std::vector<std::uint8_t> &batch, std::uint32_t rows)
+  void abort()
   {
-    ++successful_batches;
-    if (successful_batches == 1)
-    {
-      replay_batch= batch;
-      replay_rows= rows;
-    }
-    else
-    {
-      clear_replay_batch();
-    }
-  }
-
-  void clear_replay_batch()
-  {
-    replay_batch.clear();
-    replay_rows= 0;
+    if (failed)
+      return;
+    session->reset();
+    connection= nullptr;
+    operation_open= false;
+    operation_id= 0;
     successful_batches= 0;
+    reset_pending();
+    failed= true;
   }
 
   void reset_pending()
@@ -941,10 +1051,11 @@ struct InsertContext
     pending_rows= 0;
   }
 
-  exasol_gw::SessionGwOptions options;
-  exasol_gw::SessionGwConnection connection;
-  bool connected= false;
+  exasol_gw::SessionGwThdContext *session;
+  exasol_gw::SessionGwConnection *connection;
+  bool initialized= false;
   bool operation_open= false;
+  bool failed= false;
   std::uint64_t operation_id= 0;
   std::string schema;
   std::string object;
@@ -952,21 +1063,21 @@ struct InsertContext
   exasol_gw::SessionGwDescribeTableResult described;
   std::uint32_t max_rows_per_batch= 10000;
   std::uint32_t pending_rows= 0;
-  std::uint32_t replay_rows= 0;
   std::uint32_t successful_batches= 0;
   std::vector<NativeColumnBuffer> pending_columns;
-  std::vector<std::uint8_t> replay_batch;
 };
 
 struct UpdateContext
 {
-  explicit UpdateContext(std::uint32_t max_rows): max_rows_per_batch(max_rows) {}
+  UpdateContext(std::uint32_t max_rows, THD *thd)
+    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
+      max_rows_per_batch(max_rows) {}
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
   {
     try
     {
-      ensure_open(table);
+      ensure_operation_open(table);
       if (pending_columns.empty())
       {
         for (Field **field= table->field; *field; ++field)
@@ -980,7 +1091,10 @@ struct UpdateContext
       for (Field **field= table->field; *field; ++field, ++column_index)
       {
         if (!append_field_to_column_buffer(pending_columns[column_index], *field))
+        {
+          abort();
           return HA_ERR_UNSUPPORTED;
+        }
       }
       pending_handles.push_back(row_handle);
       ++pending_rows;
@@ -990,6 +1104,7 @@ struct UpdateContext
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -997,18 +1112,18 @@ struct UpdateContext
 
   int close(TABLE *table)
   {
+    if (failed)
+      return 0;
     try
     {
-      int rc= flush(table);
-      const int close_rc= close_operation();
-      connection.close();
-      connected= false;
+      const int rc= flush(table);
       if (rc != 0)
         return rc;
-      return close_rc;
+      return close_operation();
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -1016,36 +1131,40 @@ struct UpdateContext
 
   void ensure_open(TABLE *table)
   {
-    if (connected)
+    if (initialized)
       return;
-    options= exasol_gw::options_from_environment();
-    connection.connect_and_enter(options);
-    connected= true;
     schema= table_schema_name(table);
     object= table_object_name(table);
     columns= table_column_names(table);
-    described= connection.describe_table(schema, object);
+    described= connection->describe_table(schema, object);
+    initialized= true;
   }
 
   int flush(TABLE *table)
   {
-    if (pending_rows == 0)
+    if (failed || pending_rows == 0)
       return 0;
     std::vector<std::uint8_t> batch;
     if (!build_native_batch_from_columns(pending_columns, pending_rows, &batch))
+    {
+      abort();
       return HA_ERR_UNSUPPORTED;
+    }
 
     try
     {
-      ensure_operation_open(table);
-      const std::uint64_t affected= connection.update_rows(operation_id, pending_handles, batch);
+      const std::uint64_t affected= connection->update_rows(operation_id, pending_handles, batch);
       if (affected != pending_rows)
+      {
+        abort();
         return HA_ERR_KEY_NOT_FOUND;
+      }
       reset_pending();
       return 0;
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -1057,19 +1176,41 @@ struct UpdateContext
     if (operation_open)
       return;
     const exasol_gw::SessionGwOpenOperationResult opened=
-        connection.open_table_update(schema, object, columns, max_rows_per_batch, described.arrow_schema);
+        connection->open_table_update(schema, object, columns, max_rows_per_batch, described.arrow_schema);
     operation_id= opened.operation_id;
     operation_open= true;
+    session->operation_opened();
   }
 
   int close_operation()
   {
     if (!operation_open)
       return 0;
-    connection.close_operation(operation_id);
+    try
+    {
+      connection->close_operation(operation_id);
+      operation_open= false;
+      operation_id= 0;
+      session->operation_closed();
+      return 0;
+    }
+    catch (...)
+    {
+      abort();
+      throw;
+    }
+  }
+
+  void abort()
+  {
+    if (failed)
+      return;
+    session->reset();
+    connection= nullptr;
     operation_open= false;
     operation_id= 0;
-    return 0;
+    reset_pending();
+    failed= true;
   }
 
   void reset_pending()
@@ -1079,10 +1220,11 @@ struct UpdateContext
     pending_rows= 0;
   }
 
-  exasol_gw::SessionGwOptions options;
-  exasol_gw::SessionGwConnection connection;
-  bool connected= false;
+  exasol_gw::SessionGwThdContext *session;
+  exasol_gw::SessionGwConnection *connection;
+  bool initialized= false;
   bool operation_open= false;
+  bool failed= false;
   std::uint64_t operation_id= 0;
   std::string schema;
   std::string object;
@@ -1096,13 +1238,15 @@ struct UpdateContext
 
 struct DeleteContext
 {
-  explicit DeleteContext(std::uint32_t max_rows): max_rows_per_batch(max_rows) {}
+  DeleteContext(std::uint32_t max_rows, THD *thd)
+    : session(&exasol_gw::session_for_thd(thd)), connection(&session->connection()),
+      max_rows_per_batch(max_rows) {}
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
   {
     try
     {
-      ensure_open(table);
+      ensure_operation_open(table);
       pending_handles.push_back(row_handle);
       if (pending_handles.size() >= max_rows_per_batch)
         return flush(table);
@@ -1110,6 +1254,7 @@ struct DeleteContext
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -1117,18 +1262,18 @@ struct DeleteContext
 
   int close(TABLE *table)
   {
+    if (failed)
+      return 0;
     try
     {
-      int rc= flush(table);
-      const int close_rc= close_operation();
-      connection.close();
-      connected= false;
+      const int rc= flush(table);
       if (rc != 0)
         return rc;
-      return close_rc;
+      return close_operation();
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -1136,30 +1281,31 @@ struct DeleteContext
 
   void ensure_open(TABLE *table)
   {
-    if (connected)
+    if (initialized)
       return;
-    options= exasol_gw::options_from_environment();
-    connection.connect_and_enter(options);
-    connected= true;
     schema= table_schema_name(table);
     object= table_object_name(table);
+    initialized= true;
   }
 
-  int flush(TABLE *table)
+  int flush(TABLE *)
   {
-    if (pending_handles.empty())
+    if (failed || pending_handles.empty())
       return 0;
     try
     {
-      ensure_operation_open(table);
-      const std::uint64_t affected= connection.delete_rows(operation_id, pending_handles);
+      const std::uint64_t affected= connection->delete_rows(operation_id, pending_handles);
       if (affected != pending_handles.size())
+      {
+        abort();
         return HA_ERR_KEY_NOT_FOUND;
+      }
       pending_handles.clear();
       return 0;
     }
     catch (const std::exception &ex)
     {
+      abort();
       my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, ex.what());
       return HA_ERR_INTERNAL_ERROR;
     }
@@ -1171,25 +1317,48 @@ struct DeleteContext
     if (operation_open)
       return;
     const exasol_gw::SessionGwOpenOperationResult opened=
-        connection.open_table_delete(schema, object, max_rows_per_batch);
+        connection->open_table_delete(schema, object, max_rows_per_batch);
     operation_id= opened.operation_id;
     operation_open= true;
+    session->operation_opened();
   }
 
   int close_operation()
   {
     if (!operation_open)
       return 0;
-    connection.close_operation(operation_id);
-    operation_open= false;
-    operation_id= 0;
-    return 0;
+    try
+    {
+      connection->close_operation(operation_id);
+      operation_open= false;
+      operation_id= 0;
+      session->operation_closed();
+      return 0;
+    }
+    catch (...)
+    {
+      abort();
+      throw;
+    }
   }
 
-  exasol_gw::SessionGwOptions options;
-  exasol_gw::SessionGwConnection connection;
-  bool connected= false;
+  void abort()
+  {
+    if (failed)
+      return;
+    session->reset();
+    connection= nullptr;
+    operation_open= false;
+    operation_id= 0;
+    pending_handles.clear();
+    failed= true;
+  }
+
+  exasol_gw::SessionGwThdContext *session;
+  exasol_gw::SessionGwConnection *connection;
+  bool initialized= false;
   bool operation_open= false;
+  bool failed= false;
   std::uint64_t operation_id= 0;
   std::string schema;
   std::string object;
@@ -1208,7 +1377,7 @@ ha_exasol_gw::~ha_exasol_gw()
 void ha_exasol_gw::start_bulk_insert(ha_rows, uint)
 {
   if (!insert_context)
-    insert_context= new InsertContext(insert_batch_rows_from_environment());
+    insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
 }
 
 int ha_exasol_gw::end_bulk_insert()
@@ -1271,7 +1440,7 @@ int ha_exasol_gw::close_dml_contexts()
 int ha_exasol_gw::write_row(const uchar *)
 {
   if (!insert_context)
-    insert_context= new InsertContext(insert_batch_rows_from_environment());
+    insert_context= new InsertContext(insert_batch_rows_from_environment(), table->in_use);
   if (!insert_context)
     return HA_ERR_OUT_OF_MEM;
   return insert_context->append(table);
@@ -1282,7 +1451,7 @@ int ha_exasol_gw::update_row(const uchar *, const uchar *new_data)
   if (new_data != table->record[0])
     return HA_ERR_WRONG_COMMAND;
   if (!update_context)
-    update_context= new UpdateContext(update_batch_rows_from_environment());
+    update_context= new UpdateContext(update_batch_rows_from_environment(), table->in_use);
   if (!update_context)
     return HA_ERR_OUT_OF_MEM;
   const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
@@ -1295,7 +1464,7 @@ int ha_exasol_gw::update_row(const uchar *, const uchar *new_data)
 int ha_exasol_gw::delete_row(const uchar *)
 {
   if (!delete_context)
-    delete_context= new DeleteContext(delete_batch_rows_from_environment());
+    delete_context= new DeleteContext(delete_batch_rows_from_environment(), table->in_use);
   if (!delete_context)
     return HA_ERR_OUT_OF_MEM;
   const exasol_gw::SessionGwRowHandle row_handle= have_positioned_row_handle
@@ -1471,11 +1640,18 @@ static derived_handler *create_exasol_gw_derived_handler(THD *thd,
   return new ha_exasol_gw_derived_handler(thd, derived, tbl);
 }
 
+static int exasol_gw_close_connection(THD *thd)
+{
+  exasol_gw::destroy_session_for_thd(thd);
+  return 0;
+}
+
 static int exasol_gw_init(void *p)
 {
   exasol_gw_hton= static_cast<handlerton *>(p);
   exasol_gw_hton->db_type= DB_TYPE_AUTOASSIGN;
   exasol_gw_hton->create= exasol_gw_create_handler;
+  exasol_gw_hton->close_connection= exasol_gw_close_connection;
   exasol_gw_hton->create_select= create_exasol_gw_select_handler;
   exasol_gw_hton->create_unit= create_exasol_gw_unit_handler;
   exasol_gw_hton->create_derived= create_exasol_gw_derived_handler;

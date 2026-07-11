@@ -14,6 +14,7 @@ SET(EXASOL_GW_SOURCES
   exasol_native_write_batch.cc
   exasol_gw_pushdown.cc
   exasol_gw_sql_generator.cc
+  exasol_gw_session.cc
   exasol_sessiongw_client.cc
   ha_exasol_gw.cc)
 
