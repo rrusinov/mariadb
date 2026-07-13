@@ -15,6 +15,7 @@
 #include "exasol_native_write_batch.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1120,11 +1121,17 @@ struct InsertContext
     if (failed || pending_rows == 0)
       return 0;
     std::vector<std::uint8_t> batch;
+    const auto encode_started= session->instrumentation_enabled()
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!build_native_batch_from_columns(pending_columns, pending_rows, &batch))
     {
       abort();
       return HA_ERR_UNSUPPORTED;
     }
+    if (session->instrumentation_enabled())
+      session->record_native_encode(static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - encode_started).count()));
 
     try
     {
@@ -1302,11 +1309,17 @@ struct UpdateContext
     if (failed || pending_rows == 0)
       return 0;
     std::vector<std::uint8_t> batch;
+    const auto encode_started= session->instrumentation_enabled()
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!build_native_batch_from_columns(pending_columns, pending_rows, &batch))
     {
       abort();
       return HA_ERR_UNSUPPORTED;
     }
+    if (session->instrumentation_enabled())
+      session->record_native_encode(static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - encode_started).count()));
 
     try
     {

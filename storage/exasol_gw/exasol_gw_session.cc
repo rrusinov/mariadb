@@ -3,11 +3,13 @@
 
 #include "handler.h"
 #include "sql_class.h"
+#include "log.h"
 
 #include "exasol_gw_session.h"
 
 #include <algorithm>
 #include <chrono>
+#include <inttypes.h>
 #include <stdexcept>
 #include <thread>
 
@@ -18,7 +20,7 @@ namespace exasol_gw
 
 namespace
 {
-void connect_with_retry(SessionGwConnection &connection, const SessionGwOptions &options)
+std::uint64_t connect_with_retry(SessionGwConnection &connection, const SessionGwOptions &options)
 {
   // Only bootstrap of a fresh physical session is repeated here. No cursor or
   // write request has been issued, and active SessionGW work is never replayed.
@@ -28,7 +30,7 @@ void connect_with_retry(SessionGwConnection &connection, const SessionGwOptions 
     try
     {
       connection.connect_and_enter(options);
-      return;
+      return static_cast<std::uint64_t>(attempt + 1);
     }
     catch (const SessionGwError &error)
     {
@@ -43,11 +45,50 @@ void connect_with_retry(SessionGwConnection &connection, const SessionGwOptions 
 }
 } // namespace
 
+SessionGwThdContext::~SessionGwThdContext()
+{
+  if (!options_.instrumentation_enabled)
+    return;
+  const SessionGwClientStatistics &client= connection_.statistics();
+  sql_print_information(
+      "SessionGW performance: connection_attempts=%" PRIu64
+      " connection_retries=%" PRIu64 " requests=%" PRIu64
+      " request_bytes=%" PRIu64 " response_bytes=%" PRIu64
+      " network_ns=%" PRIu64 " metadata_hits=%" PRIu64
+      " metadata_misses=%" PRIu64 " cursors=%" PRIu64
+      " operations=%" PRIu64 " fetch_batches=%" PRIu64
+      " fetched_rows=%" PRIu64 " arrow_bytes=%" PRIu64
+      " projected_columns=%" PRIu64 " available_columns=%" PRIu64
+      " arrow_decode_ns=%" PRIu64 " row_materialize_ns=%" PRIu64
+      " native_encode_ns=%" PRIu64 " insert_batches=%" PRIu64 " insert_rows=%" PRIu64
+      " update_batches=%" PRIu64 " update_rows=%" PRIu64
+      " delete_batches=%" PRIu64 " delete_rows=%" PRIu64
+      " native_write_bytes=%" PRIu64 " transaction_conflicts=%" PRIu64,
+      statistics_.connection_attempts, statistics_.connection_retries,
+      client.requests, client.request_bytes, client.response_bytes,
+      client.network_nanoseconds, statistics_.metadata_cache_hits,
+      statistics_.metadata_cache_misses, statistics_.cursors_opened,
+      statistics_.operations_opened, statistics_.fetch_batches,
+      statistics_.fetched_rows, statistics_.arrow_bytes,
+      statistics_.projected_columns, statistics_.available_columns,
+      statistics_.arrow_decode_nanoseconds,
+      statistics_.row_materialize_nanoseconds,
+      statistics_.native_encode_nanoseconds, client.insert_batches,
+      client.insert_rows, client.update_batches, client.update_rows,
+      client.delete_batches, client.delete_rows, client.native_write_bytes,
+      client.transaction_conflicts);
+}
+
 SessionGwConnection &SessionGwThdContext::connection()
 {
   if (!connected_)
   {
-    connect_with_retry(connection_, options_);
+    const std::uint64_t attempts= connect_with_retry(connection_, options_);
+    if (options_.instrumentation_enabled)
+    {
+      statistics_.connection_attempts += attempts;
+      statistics_.connection_retries += attempts - 1U;
+    }
     connected_= true;
   }
   return connection_;
@@ -61,12 +102,16 @@ SessionGwDescribeTableResult SessionGwThdContext::describe_table(
   {
     if (cached.schema_name != schema || cached.table_name != table)
       continue;
+    if (options_.instrumentation_enabled)
+      ++statistics_.metadata_cache_hits;
     const std::string current_version= session.get_table_version(schema, table);
     if (current_version != cached.table_version)
       cached= session.describe_table(schema, table);
     return cached;
   }
 
+  if (options_.instrumentation_enabled)
+    ++statistics_.metadata_cache_misses;
   SessionGwDescribeTableResult described= session.describe_table(schema, table);
   metadata_cache_.push_back(described);
   return described;
@@ -75,6 +120,8 @@ SessionGwDescribeTableResult SessionGwThdContext::describe_table(
 void SessionGwThdContext::read_cursor_opened()
 {
   ++open_cursors_;
+  if (options_.instrumentation_enabled)
+    ++statistics_.cursors_opened;
   read_transaction_pending_= true;
 }
 
@@ -88,6 +135,8 @@ void SessionGwThdContext::read_cursor_closed()
 void SessionGwThdContext::operation_opened()
 {
   ++open_operations_;
+  if (options_.instrumentation_enabled)
+    ++statistics_.operations_opened;
 }
 
 void SessionGwThdContext::operation_closed()
@@ -108,6 +157,43 @@ void SessionGwThdContext::statement_table_closed()
   if (statement_tables_ > 0)
     --statement_tables_;
   finish_idle_read_transaction();
+}
+
+void SessionGwThdContext::record_projection(std::size_t projected_columns,
+                                             std::size_t available_columns)
+{
+  if (!options_.instrumentation_enabled)
+    return;
+  statistics_.projected_columns += projected_columns;
+  statistics_.available_columns += available_columns;
+}
+
+void SessionGwThdContext::record_fetch(std::size_t rows, std::size_t arrow_bytes,
+                                       std::uint64_t decode_nanoseconds)
+{
+  if (!options_.instrumentation_enabled)
+    return;
+  ++statistics_.fetch_batches;
+  statistics_.fetched_rows += rows;
+  statistics_.arrow_bytes += arrow_bytes;
+  statistics_.arrow_decode_nanoseconds += decode_nanoseconds;
+}
+
+void SessionGwThdContext::record_row_materialize(std::uint64_t nanoseconds)
+{
+  if (options_.instrumentation_enabled)
+    statistics_.row_materialize_nanoseconds += nanoseconds;
+}
+
+void SessionGwThdContext::record_native_encode(std::uint64_t nanoseconds)
+{
+  if (options_.instrumentation_enabled)
+    statistics_.native_encode_nanoseconds += nanoseconds;
+}
+
+bool SessionGwThdContext::instrumentation_enabled() const noexcept
+{
+  return options_.instrumentation_enabled;
 }
 
 void SessionGwThdContext::finish_idle_read_transaction()

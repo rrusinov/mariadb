@@ -92,6 +92,23 @@ struct SessionGwOptions
   std::string tls_mode= "skip_verify"; // verify, skip_verify, plain
   std::string ca_file;
   std::uint32_t fetch_rows= 1024;
+  bool instrumentation_enabled= false;
+};
+
+struct SessionGwClientStatistics
+{
+  std::uint64_t requests= 0;
+  std::uint64_t request_bytes= 0;
+  std::uint64_t response_bytes= 0;
+  std::uint64_t network_nanoseconds= 0;
+  std::uint64_t insert_batches= 0;
+  std::uint64_t insert_rows= 0;
+  std::uint64_t update_batches= 0;
+  std::uint64_t update_rows= 0;
+  std::uint64_t delete_batches= 0;
+  std::uint64_t delete_rows= 0;
+  std::uint64_t native_write_bytes= 0;
+  std::uint64_t transaction_conflicts= 0;
 };
 
 struct SessionGwOpenCursorResult
@@ -195,6 +212,7 @@ public:
                              std::uint32_t max_rows,
                              std::uint32_t max_bytes= 0);
   void close_cursor(std::uint64_t cursor_id);
+  const SessionGwClientStatistics &statistics() const noexcept;
 
 private:
   class Impl;

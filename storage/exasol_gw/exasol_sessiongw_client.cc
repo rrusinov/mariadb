@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -464,6 +465,8 @@ SessionGwOptions options_from_environment()
   options.tls_mode= env_or_default("EXASOL_SESSIONGW_TLS", options.tls_mode.c_str());
   options.ca_file= env_or_default("EXASOL_SESSIONGW_CA_FILE", "");
   options.fetch_rows= env_u32_or_default("EXASOL_SESSIONGW_FETCH_ROWS", options.fetch_rows);
+  options.instrumentation_enabled=
+      env_or_default("EXASOL_SESSIONGW_INSTRUMENTATION", "0") != "0";
   return options;
 }
 
@@ -631,6 +634,12 @@ public:
     SessionGwFrame frame= request(SessionGwMessageType::insert_rows,
                                   payload,
                                   SessionGwMessageType::affected_rows_result);
+    if (options_.instrumentation_enabled)
+    {
+      ++statistics_.insert_batches;
+      statistics_.insert_rows += row_count;
+      statistics_.native_write_bytes += native_batch.size();
+    }
     return parse_affected_rows(frame);
   }
 
@@ -721,6 +730,12 @@ public:
     SessionGwFrame frame= request(SessionGwMessageType::update_rows,
                                   payload,
                                   SessionGwMessageType::affected_rows_result);
+    if (options_.instrumentation_enabled)
+    {
+      ++statistics_.update_batches;
+      statistics_.update_rows += row_handles.size();
+      statistics_.native_write_bytes += native_batch.size();
+    }
     return parse_affected_rows(frame);
   }
 
@@ -747,6 +762,11 @@ public:
     SessionGwFrame frame= request(SessionGwMessageType::delete_rows,
                                   payload,
                                   SessionGwMessageType::affected_rows_result);
+    if (options_.instrumentation_enabled)
+    {
+      ++statistics_.delete_batches;
+      statistics_.delete_rows += row_handles.size();
+    }
     return parse_affected_rows(frame);
   }
 
@@ -904,18 +924,47 @@ private:
                          const std::vector<std::uint8_t> &payload,
                          SessionGwMessageType expected)
   {
-    send_frame(type, payload);
-    SessionGwFrame frame= receive_frame();
-    throw_if_error_frame(frame);
-    if (frame.type != expected)
+    const auto started= options_.instrumentation_enabled ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
+    if (options_.instrumentation_enabled)
     {
-      std::ostringstream out;
-      out << "unexpected SessionGW frame type " << static_cast<std::uint16_t>(frame.type)
-          << ", expected " << static_cast<std::uint16_t>(expected);
-      throw SessionGwError(out.str());
+      ++statistics_.requests;
+      statistics_.request_bytes += frame_header_size + payload.size();
     }
-    return frame;
+    try
+    {
+      send_frame(type, payload);
+      SessionGwFrame frame= receive_frame();
+      if (options_.instrumentation_enabled)
+      {
+        statistics_.response_bytes += frame_header_size + frame.payload.size();
+        statistics_.network_nanoseconds += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+      }
+      throw_if_error_frame(frame);
+      if (frame.type != expected)
+      {
+        std::ostringstream out;
+        out << "unexpected SessionGW frame type " << static_cast<std::uint16_t>(frame.type)
+            << ", expected " << static_cast<std::uint16_t>(expected);
+        throw SessionGwError(out.str());
+      }
+      return frame;
+    }
+    catch (const SessionGwError &error)
+    {
+      if (options_.instrumentation_enabled &&
+          error.category() == SessionGwErrorCategory::transaction_conflict)
+        ++statistics_.transaction_conflicts;
+      throw;
+    }
   }
+
+public:
+  const SessionGwClientStatistics &statistics() const noexcept { return statistics_; }
+
+private:
 
   SessionGwOpenCursorResult parse_open_cursor(const SessionGwFrame &frame)
   {
@@ -1004,6 +1053,7 @@ private:
   SSL *ssl_= nullptr;
   std::uint64_t request_id_= 1;
   bool session_gateway_entered_= false;
+  SessionGwClientStatistics statistics_;
 };
 
 SessionGwConnection::SessionGwConnection(): impl_(new Impl()) {}
@@ -1134,6 +1184,11 @@ void SessionGwConnection::commit()
 void SessionGwConnection::rollback()
 {
   impl_->rollback();
+}
+
+const SessionGwClientStatistics &SessionGwConnection::statistics() const noexcept
+{
+  return impl_->statistics();
 }
 
 } // namespace exasol_gw

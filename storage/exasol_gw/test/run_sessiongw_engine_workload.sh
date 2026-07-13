@@ -159,6 +159,7 @@ EXASOL_SESSIONGW_PORT=$EXASOL_PORT \
 EXASOL_SESSIONGW_USER=sys \
 EXASOL_SESSIONGW_PASSWORD=exasol \
 EXASOL_SESSIONGW_TLS=skip_verify \
+EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
 "$MARIADB_BUILD/sql/mariadbd" --no-defaults \
     --datadir="$MDB/data" --socket="$SOCKET" --pid-file="$PIDFILE" \
     --port=0 --skip-networking \
@@ -471,5 +472,26 @@ mysql -e "USE $SCHEMA; DROP TABLE ABORT_GUARD; DROP TABLE NULLABILITY_GUARD; DRO
 ABSENT=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA' and table_name='T'")
 echo "$ABSENT" | grep -q '"data":\[\[0\]\]'
 log "PASS drop table removed backing Exasol table"
+
+PERFORMANCE_SUMMARY=$(python3 - "$MDB/mariadb.err" <<'PY'
+import re
+import sys
+
+values = {}
+lines = 0
+with open(sys.argv[1], encoding="utf-8", errors="replace") as log_file:
+    for line in log_file:
+        if "SessionGW performance:" not in line:
+            continue
+        lines += 1
+        for name, value in re.findall(r"([a-z_]+)=([0-9]+)", line):
+            values[name] = values.get(name, 0) + int(value)
+if lines == 0:
+    raise SystemExit("no SessionGW performance records found")
+print("SessionGW performance aggregate: sessions=" + str(lines) + " " +
+      " ".join(f"{name}={values[name]}" for name in sorted(values)))
+PY
+)
+log "$PERFORMANCE_SUMMARY"
 
 log "SessionGW MariaDB engine workload passed"

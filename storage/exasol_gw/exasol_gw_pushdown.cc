@@ -12,6 +12,7 @@
 #include "exasol_gw_sql_generator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -222,6 +223,7 @@ void ha_exasol_gw_cursor::initialize_column_kinds(TABLE *table_arg)
     column_kinds.push_back(kind_for_field(*field));
     selected_field_indices.push_back(field_index);
   }
+  session->record_projection(selected_field_indices.size(), field_index);
 }
 
 std::vector<std::string> ha_exasol_gw_cursor::initialize_table_scan_columns(TABLE *table_arg)
@@ -259,6 +261,7 @@ std::vector<std::string> ha_exasol_gw_cursor::initialize_table_scan_columns(TABL
     column_kinds.push_back(kind_for_field(table_arg->field[0]));
     selected_field_indices.push_back(0);
   }
+  session->record_projection(selected_field_indices.size(), field_index);
   return columns;
 }
 
@@ -352,7 +355,13 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
     {
       exasol_gw::SessionGwFetchResult fetched= connection->fetch(cursor_id, options.fetch_rows, 0);
       end_of_cursor= fetched.end_of_cursor;
+      const auto decode_started= options.instrumentation_enabled
+          ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       current_batch= exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
+      const std::uint64_t decode_nanoseconds= options.instrumentation_enabled
+          ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - decode_started).count()) : 0U;
+      session->record_fetch(current_batch.rows, fetched.arrow_batch.size(), decode_nanoseconds);
       current_row_handles= fetched.row_handles;
       current_row= 0;
       if (current_batch.rows > 0)
@@ -378,6 +387,8 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     return HA_ERR_END_OF_FILE;
   try
   {
+    const auto materialize_started= options.instrumentation_enabled
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DbugWriteSetGuard write_set_guard(table_arg);
     if (current_batch.columns.size() != selected_field_indices.size())
       throw std::runtime_error("SessionGW Arrow column count does not match projected MariaDB fields");
@@ -399,6 +410,10 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     if (current_row < current_row_handles.size())
       last_row_handle_= current_row_handles[current_row];
     ++current_row;
+    if (options.instrumentation_enabled)
+      session->record_row_materialize(static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - materialize_started).count()));
     return 0;
   }
   catch (...)
