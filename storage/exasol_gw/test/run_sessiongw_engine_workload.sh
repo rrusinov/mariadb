@@ -24,8 +24,23 @@ PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
 PERF_UPDATE_ROWS=${PERF_UPDATE_ROWS:-$((PERF_ROWS / 10))}
 PERF_DELETE_ROWS=${PERF_DELETE_ROWS:-$((PERF_ROWS / 20))}
 FAULT_INJECTION_ONLY=${FAULT_INJECTION_ONLY:-0}
+POSITIONED_DML_TEST_ONLY=${POSITIONED_DML_TEST_ONLY:-0}
+POSITIONED_DML_BATCH_ROWS=${POSITIONED_DML_BATCH_ROWS:-3}
 if (( PERF_UPDATE_ROWS == 0 )); then PERF_UPDATE_ROWS=1; fi
 if (( PERF_DELETE_ROWS == 0 )); then PERF_DELETE_ROWS=1; fi
+if [[ "$POSITIONED_DML_TEST_ONLY" == "1" && ! "$POSITIONED_DML_BATCH_ROWS" =~ ^[3-9][0-9]*$ ]]; then
+    echo "POSITIONED_DML_BATCH_ROWS must be at least 3" >&2
+    exit 2
+fi
+
+UPDATE_BATCH_ROWS=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}
+DELETE_BATCH_ROWS=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}
+if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
+    # This focused mode makes two-row DML stay below a known threshold without
+    # distorting the workload's performance baseline.
+    UPDATE_BATCH_ROWS=$POSITIONED_DML_BATCH_ROWS
+    DELETE_BATCH_ROWS=$POSITIONED_DML_BATCH_ROWS
+fi
 
 require_file() {
     if [[ ! -e "$1" ]]; then
@@ -137,8 +152,11 @@ log "perf_delete_rows=$PERF_DELETE_ROWS"
 log "insert_rounds=$INSERT_ROUNDS"
 log "insert_rows_per_client=$INSERT_ROWS_PER_CLIENT"
 log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
-log "sessiongw_update_batch_rows=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}"
-log "sessiongw_delete_batch_rows=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}"
+log "sessiongw_update_batch_rows=$UPDATE_BATCH_ROWS"
+log "sessiongw_delete_batch_rows=$DELETE_BATCH_ROWS"
+if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
+    log "positioned_dml_test_only=1 positioned_dml_batch_rows=$POSITIONED_DML_BATCH_ROWS"
+fi
 
 "$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
 APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
@@ -160,6 +178,8 @@ EXASOL_SESSIONGW_USER=sys \
 EXASOL_SESSIONGW_PASSWORD=exasol \
 EXASOL_SESSIONGW_TLS=skip_verify \
 EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
+EXASOL_SESSIONGW_UPDATE_BATCH_ROWS=$UPDATE_BATCH_ROWS \
+EXASOL_SESSIONGW_DELETE_BATCH_ROWS=$DELETE_BATCH_ROWS \
 "$MARIADB_BUILD/sql/mariadbd" --no-defaults \
     --datadir="$MDB/data" --socket="$SOCKET" --pid-file="$PIDFILE" \
     --port=0 --skip-networking \
@@ -231,19 +251,66 @@ if [[ "$FAULT_INJECTION_ONLY" == "1" ]]; then
     exit 0
 fi
 
+# Multi-table DML makes MariaDB re-read EXASOL rows by position.  In focused
+# mode the two-row cases are deliberately below the three-row operation limit.
 mysql --table <<SQL | tee -a "$REPORT"
 USE $SCHEMA;
 CREATE TABLE POS_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;
-INSERT INTO POS_T VALUES (1, 'One'), (2, 'Two'), (3, 'Three'), (4, 'Four');
+INSERT INTO POS_T VALUES
+  (1, 'One'), (2, 'Two'), (3, 'Three'), (4, 'Four'), (5, 'Five'),
+  (6, 'Six'), (7, 'Seven'), (8, 'Eight'), (9, 'Nine'), (10, 'Ten');
 CREATE TABLE POS_KEYS(ID INT) ENGINE=InnoDB;
-INSERT INTO POS_KEYS VALUES (2), (3);
-UPDATE POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID SET p.NAME='Matched' WHERE k.ID=2;
+INSERT INTO POS_KEYS VALUES (2), (3), (4), (5), (6), (7);
+UPDATE POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID SET p.NAME='one-update' WHERE k.ID=2;
+UPDATE POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID SET p.NAME='multi-update' WHERE k.ID IN (4, 5);
 DELETE p FROM POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID WHERE k.ID=3;
-SELECT * FROM POS_T ORDER BY ID;
+DELETE p FROM POS_T AS p JOIN POS_KEYS AS k ON p.ID=k.ID WHERE k.ID IN (6, 7);
 SQL
-expect_scalar "positioned update/delete final" \
-    "USE $SCHEMA; SELECT CONCAT(COUNT(*), '|', SUM(CASE WHEN ID=2 AND NAME='Matched' THEN 1 ELSE 0 END), '|', SUM(CASE WHEN ID=3 THEN 1 ELSE 0 END)) FROM POS_T" \
-    "3|1|0"
+POS_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM POS_T; SELECT SUM(ID) FROM POS_T; SELECT COUNT(*) FROM POS_T WHERE NAME='one-update'; SELECT COUNT(*) FROM POS_T WHERE NAME='multi-update'; SELECT COUNT(*) FROM POS_T WHERE ID IN (3, 6, 7);" | paste -sd'|' -)
+if [[ "$POS_FINAL" != "7|39|1|2|0" ]]; then
+    echo "Unexpected positioned DML final state: $POS_FINAL" >&2
+    exit 1
+fi
+log "PASS positioned one-row and below-threshold multi-row DML final = $POS_FINAL"
+
+# EXASOL is declared HA_NO_TRANSACTIONS, so MariaDB cannot expose a stale row
+# handle directly or roll back an already closed remote operation.  The closest
+# adapter-visible boundary check is positioned DML after ROLLBACK and after a
+# real COMMIT: it must address its new row, while rollback leaves the preceding
+# non-transactional remote DML.
+mysql --table <<SQL | tee -a "$REPORT"
+USE $SCHEMA;
+CREATE TABLE TXN_POS_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;
+INSERT INTO TXN_POS_T VALUES (1, 'One'), (2, 'Two'), (3, 'Three'), (4, 'Four'), (5, 'Five'), (6, 'Six');
+CREATE TABLE TXN_POS_KEYS(ID INT) ENGINE=InnoDB;
+INSERT INTO TXN_POS_KEYS VALUES (1), (2), (3), (4);
+START TRANSACTION;
+UPDATE TXN_POS_T AS p JOIN TXN_POS_KEYS AS k ON p.ID=k.ID SET p.NAME='before-rollback' WHERE k.ID=1;
+ROLLBACK;
+UPDATE TXN_POS_T AS p JOIN TXN_POS_KEYS AS k ON p.ID=k.ID SET p.NAME='after-rollback' WHERE k.ID=2;
+COMMIT;
+START TRANSACTION;
+DELETE p FROM TXN_POS_T AS p JOIN TXN_POS_KEYS AS k ON p.ID=k.ID WHERE k.ID=3;
+COMMIT;
+DELETE p FROM TXN_POS_T AS p JOIN TXN_POS_KEYS AS k ON p.ID=k.ID WHERE k.ID=4;
+SQL
+TXN_POS_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM TXN_POS_T; SELECT SUM(ID) FROM TXN_POS_T; SELECT COUNT(*) FROM TXN_POS_T WHERE ID=1 AND NAME='before-rollback'; SELECT COUNT(*) FROM TXN_POS_T WHERE ID=2 AND NAME='after-rollback'; SELECT COUNT(*) FROM TXN_POS_T WHERE ID IN (3, 4);" | paste -sd'|' -)
+if [[ "$TXN_POS_FINAL" != "4|14|1|1|0" ]]; then
+    echo "Unexpected positioned transaction-boundary state: $TXN_POS_FINAL" >&2
+    exit 1
+fi
+TXN_POS_REMOTE=$(sql_exasol "select count(*), sum(id) from $SCHEMA.TXN_POS_T")
+echo "$TXN_POS_REMOTE" | tee -a "$REPORT" | grep -Eq '"data":\[\[4\],\["?14"?\]\]'
+log "PASS positioned transaction boundary cleanup = $TXN_POS_FINAL"
+
+if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
+    mysql -e "DROP DATABASE $SCHEMA" >/dev/null
+    FOCUSED_TABLES=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA'")
+    echo "$FOCUSED_TABLES" | grep -q '"data":\[\[0\]\]'
+    log "SessionGW focused positioned DML workload passed"
+    exit 0
+fi
+
 log "PASS positioned update delete"
 
 expect_scalar "prepared statement count" \
