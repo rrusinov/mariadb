@@ -490,6 +490,12 @@ CHARSET_INFO *declared_field_charset(Field *field, Create_field *create_field)
   return create_field && create_field->charset ? create_field->charset : field->charset();
 }
 
+bool is_exasol_utf8_charset(const CHARSET_INFO *charset)
+{
+  return charset && charset->cs_name.str &&
+         std::string(charset->cs_name.str, charset->cs_name.length) == "utf8mb4";
+}
+
 bool append_exasol_type(Field *field, Create_field *create_field,
                         std::string *sql, std::string *error)
 {
@@ -561,9 +567,10 @@ bool append_exasol_type(Field *field, Create_field *create_field,
   case MYSQL_TYPE_VAR_STRING:
   case MYSQL_TYPE_VARCHAR:
   {
-    if (declared_field_charset(field, create_field) == &my_charset_bin)
+    if (!is_exasol_utf8_charset(declared_field_charset(field, create_field)))
     {
-      *error= "binary strings are not supported for EXASOL field '" + field_name(field) + "'";
+      *error= "non-UTF8 string charset is not supported for EXASOL field '" +
+              field_name(field) + "'";
       return false;
     }
     const uint length= declared_field_char_length(field, create_field);
