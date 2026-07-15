@@ -26,12 +26,13 @@ public:
                         unsigned long error_buffer_size);
   int open_table_scan(TABLE *table_arg, char *error_buffer, unsigned long error_buffer_size,
                       bool include_row_handles= false);
-  int open_table_scan_by_row_handle(TABLE *table_arg,
-                                    const exasol_gw::SessionGwRowHandle &row_handle,
-                                    char *error_buffer,
-                                    unsigned long error_buffer_size);
   int fetch_row(TABLE *table_arg, unsigned char *record, char *error_buffer,
                 unsigned long error_buffer_size);
+  int fetch_positioned_row(TABLE *table_arg,
+                           const exasol_gw::SessionGwRowHandle &row_handle,
+                           unsigned char *record,
+                           char *error_buffer,
+                           unsigned long error_buffer_size);
   exasol_gw::SessionGwRowHandle last_row_handle() const { return last_row_handle_; }
   int close(char *error_buffer, unsigned long error_buffer_size);
 
@@ -39,6 +40,13 @@ private:
   int fetch_next_batch(char *error_buffer, unsigned long error_buffer_size);
   int materialize_current_row(TABLE *table_arg, unsigned char *record, char *error_buffer,
                               unsigned long error_buffer_size);
+  int materialize_row(TABLE *table_arg,
+                      const exasol_gw::ArrowRowBatch &batch,
+                      const std::vector<exasol_gw::SessionGwRowHandle> &row_handles,
+                      std::size_t row,
+                      unsigned char *record,
+                      char *error_buffer,
+                      unsigned long error_buffer_size);
   void initialize_column_kinds(TABLE *table_arg);
   std::vector<std::string> initialize_table_scan_columns(TABLE *table_arg);
 

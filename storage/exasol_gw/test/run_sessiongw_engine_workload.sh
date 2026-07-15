@@ -14,6 +14,7 @@ DB_EXANANO=${DB_EXANANO:-$(cd "$MARIADB_SRC/../db.exanano" && pwd -P)}
 NANO_RUN=${NANO_RUN:-$DB_EXANANO/.build/exasol-nano-db-2026.2.0-nano.3-x86_64.run}
 BASE_DIR=${BASE_DIR:-${TMPDIR:-/tmp}/exasol-gw-mariadb-workload.$$}
 EXASOL_PORT=${EXASOL_PORT:-8571}
+NANO_DBRAM=${EXASOL_NANO_DBRAM:-2048}
 SCHEMA=${SCHEMA:-SGW_MDB_COV}
 READ_CLIENTS=${READ_CLIENTS:-16}
 INSERT_CLIENTS=${INSERT_CLIENTS:-20}
@@ -26,6 +27,7 @@ PERF_DELETE_ROWS=${PERF_DELETE_ROWS:-$((PERF_ROWS / 20))}
 FAULT_INJECTION_ONLY=${FAULT_INJECTION_ONLY:-0}
 POSITIONED_DML_TEST_ONLY=${POSITIONED_DML_TEST_ONLY:-0}
 POSITIONED_DML_BATCH_ROWS=${POSITIONED_DML_BATCH_ROWS:-3}
+SESSIONGW_FETCH_ROWS=${EXASOL_SESSIONGW_FETCH_ROWS:-1024}
 if (( PERF_UPDATE_ROWS == 0 )); then PERF_UPDATE_ROWS=1; fi
 if (( PERF_DELETE_ROWS == 0 )); then PERF_DELETE_ROWS=1; fi
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" && ! "$POSITIONED_DML_BATCH_ROWS" =~ ^[3-9][0-9]*$ ]]; then
@@ -37,9 +39,12 @@ UPDATE_BATCH_ROWS=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}
 DELETE_BATCH_ROWS=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
     # This focused mode makes two-row DML stay below a known threshold without
-    # distorting the workload's performance baseline.
+    # distorting the workload's performance baseline. The SQL filesort probe
+    # exercises vector positioned-fetch misses only: MariaDB closes its sequential
+    # phase before beginning rowid lookup, so no current Arrow batch remains.
     UPDATE_BATCH_ROWS=$POSITIONED_DML_BATCH_ROWS
     DELETE_BATCH_ROWS=$POSITIONED_DML_BATCH_ROWS
+    SESSIONGW_FETCH_ROWS=${EXASOL_SESSIONGW_FETCH_ROWS:-1}
 fi
 
 require_file() {
@@ -141,10 +146,94 @@ expect_exasol_failure() {
     log "PASS expected Exasol failure: $label"
 }
 
+run_positioned_probe() {
+    local label=$1
+    local sql=$2
+    local expected_positioned_fetches=$3
+    local sort_data_limit=16
+    local before after metrics plan effective_sort_data_limit
+    effective_sort_data_limit=$(mysql_scalar "SET SESSION max_length_for_sort_data=$sort_data_limit; SELECT @@SESSION.max_length_for_sort_data")
+    if [[ "$effective_sort_data_limit" != "$sort_data_limit" ]]; then
+        echo "Expected max_length_for_sort_data=$sort_data_limit for $label, got $effective_sort_data_limit" >&2
+        exit 1
+    fi
+    plan=$(mysql --batch --raw -e "SET SESSION max_length_for_sort_data=$sort_data_limit; EXPLAIN $sql")
+    if ! grep -Fq 'Using filesort' <<<"$plan"; then
+        echo "Expected filesort plan for $label" >&2
+        printf '%s\n' "$plan" >&2
+        exit 1
+    fi
+    log "PASS positioned probe prerequisite $label: max_length_for_sort_data=$effective_sort_data_limit"
+    log "PASS positioned probe plan $label: $(tr '\n' '|' <<<"$plan")"
+    before=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    mysql -e "SET SESSION max_length_for_sort_data=$sort_data_limit; $sql" >"$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out"
+    after=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    if (( after != before + 1 )); then
+        echo "Expected one SessionGW metric record for $label, got $((after - before))" >&2
+        exit 1
+    fi
+    metrics=$(grep 'SessionGW performance:' "$MDB/mariadb.err" | tail -n 1)
+    python3 - "$label" "$metrics" "$expected_positioned_fetches" <<'PY'
+import re
+import sys
+label, line, expected_fetches = sys.argv[1:]
+values = {name: int(value) for name, value in re.findall(r"([a-z_]+)=([0-9]+)", line)}
+for name in ("cursors_opened", "cursors_closed", "positioned_cache_hits", "positioned_fetches", "positioned_rows"):
+    if name not in values:
+        raise SystemExit(f"{label}: missing {name} in SessionGW performance record")
+# MariaDB filesort has two handler phases: the sequential sort-key scan and
+# the subsequent rowid lookup. The invariant is one cursor per phase, rather
+# than a cursor lifecycle for every rnd_pos call.
+if values["cursors_opened"] != 2 or values["cursors_closed"] != 2:
+    raise SystemExit(f"{label}: expected two filesort phase cursor lifecycles, got {values}")
+if values["positioned_fetches"] != int(expected_fetches):
+    raise SystemExit(f"{label}: expected {expected_fetches} positioned fetches, got {values}")
+if values["positioned_rows"] != int(expected_fetches):
+    raise SystemExit(f"{label}: expected {expected_fetches} positioned rows, got {values}")
+print(f"{label}: " + " ".join(f"{name}={values[name]}" for name in
+      ("cursors_opened", "cursors_closed", "positioned_cache_hits", "positioned_fetches", "positioned_rows")))
+PY
+    log "PASS positioned probe $label metrics: $metrics"
+}
+
+run_positioned_cache_hit_probe() {
+    local label=$1
+    local sql=$2
+    local expected_cache_hits=$3
+    local before after metrics
+    before=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    mysql -e "$sql" >"$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out"
+    after=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    if (( after != before + 1 )); then
+        echo "Expected one SessionGW metric record for $label, got $((after - before))" >&2
+        exit 1
+    fi
+    metrics=$(grep 'SessionGW performance:' "$MDB/mariadb.err" | tail -n 1)
+    python3 - "$label" "$metrics" "$expected_cache_hits" <<'PY'
+import re
+import sys
+label, line, expected_hits = sys.argv[1:]
+values = {name: int(value) for name, value in re.findall(r"([a-z_]+)=([0-9]+)", line)}
+for name in ("cursors_opened", "cursors_closed", "positioned_cache_hits", "positioned_fetches", "positioned_rows"):
+    if name not in values:
+        raise SystemExit(f"{label}: missing {name} in SessionGW performance record")
+if values["cursors_opened"] != 1 or values["cursors_closed"] != 1:
+    raise SystemExit(f"{label}: expected one live-scan cursor lifecycle, got {values}")
+if values["positioned_cache_hits"] != int(expected_hits):
+    raise SystemExit(f"{label}: expected {expected_hits} positioned cache hits, got {values}")
+if values["positioned_fetches"] != 0 or values["positioned_rows"] != 0:
+    raise SystemExit(f"{label}: cache hits unexpectedly issued remote positioned fetches: {values}")
+print(f"{label}: " + " ".join(f"{name}={values[name]}" for name in
+      ("cursors_opened", "cursors_closed", "positioned_cache_hits", "positioned_fetches", "positioned_rows")))
+PY
+    log "PASS positioned cache-hit probe $label metrics: $metrics"
+}
+
 log "SessionGW MariaDB engine workload"
 log "base=$BASE_DIR"
 log "mariadb_build=$MARIADB_BUILD"
 log "nano_port=$EXASOL_PORT"
+log "nano_dbram=$NANO_DBRAM"
 log "perf_rows=$PERF_ROWS"
 log "perf_insert_batch_rows=$PERF_INSERT_BATCH_ROWS"
 log "perf_update_rows=$PERF_UPDATE_ROWS"
@@ -154,13 +243,15 @@ log "insert_rows_per_client=$INSERT_ROWS_PER_CLIENT"
 log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
 log "sessiongw_update_batch_rows=$UPDATE_BATCH_ROWS"
 log "sessiongw_delete_batch_rows=$DELETE_BATCH_ROWS"
+log "sessiongw_fetch_rows=$SESSIONGW_FETCH_ROWS"
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
     log "positioned_dml_test_only=1 positioned_dml_batch_rows=$POSITIONED_DML_BATCH_ROWS"
 fi
 
 "$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
 APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
-("$APPDIR/AppRun" --db-files-dir "$NANO_DB" --port "$EXASOL_PORT" >"$NANO_BASE/nano.log" 2>&1 & echo $! > "$NANO_BASE/pid")
+(cd "$NANO_BASE" && "$APPDIR/AppRun" --db-files-dir "$NANO_DB" --port "$EXASOL_PORT" \
+    -dbram="$NANO_DBRAM" >"$NANO_BASE/nano.log" 2>&1 & echo $! > "$NANO_BASE/pid")
 for _ in $(seq 1 90); do
     if sql_exasol 'select 1' >/dev/null 2>&1; then break; fi
     sleep 2
@@ -178,6 +269,7 @@ EXASOL_SESSIONGW_USER=sys \
 EXASOL_SESSIONGW_PASSWORD=exasol \
 EXASOL_SESSIONGW_TLS=skip_verify \
 EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
+EXASOL_SESSIONGW_FETCH_ROWS=$SESSIONGW_FETCH_ROWS \
 EXASOL_SESSIONGW_UPDATE_BATCH_ROWS=$UPDATE_BATCH_ROWS \
 EXASOL_SESSIONGW_DELETE_BATCH_ROWS=$DELETE_BATCH_ROWS \
 "$MARIADB_BUILD/sql/mariadbd" --no-defaults \
@@ -272,6 +364,27 @@ if [[ "$POS_FINAL" != "7|39|1|2|0" ]]; then
     exit 1
 fi
 log "PASS positioned one-row and below-threshold multi-row DML final = $POS_FINAL"
+
+if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
+    # The DBUG hook invokes ha_exasol_gw::rnd_pos() immediately after its real
+    # rnd_next() materializes each live row. It therefore exercises the actual
+    # current Arrow-batch cache branch without a remote positioned fetch.
+    if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
+        run_positioned_cache_hit_probe "positioned read live batch cache hit" \
+            "SET SESSION debug_dbug='+d,exasol_gw_positioned_cache_hit'; SELECT @positioned_cache_hit:=ID FROM $SCHEMA.POS_T" \
+            7
+    else
+        log "SKIP positioned live-batch cache-hit probe (MariaDB build has DBUG disabled)"
+    fi
+
+    # The low max_length_for_sort_data forces filesort to retain row positions
+    # instead of the selected VARCHAR data. MariaDB closes the sequential scan
+    # before rowid lookup, so this probe exercises vector positioned-fetch misses
+    # only, while proving there is no cursor lifecycle for every rnd_pos() call.
+    run_positioned_probe "positioned read rowid lookup" \
+        "SELECT ID, NAME FROM $SCHEMA.POS_T ORDER BY ID DESC FETCH FIRST 7 ROWS WITH TIES" \
+        7
+fi
 
 # EXASOL is declared HA_NO_TRANSACTIONS, so MariaDB cannot expose a stale row
 # handle directly or roll back an already closed remote operation.  The closest

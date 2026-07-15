@@ -20,9 +20,13 @@ struct SessionGwAdapterStatistics
   std::uint64_t metadata_cache_hits= 0;
   std::uint64_t metadata_cache_misses= 0;
   std::uint64_t cursors_opened= 0;
+  std::uint64_t cursors_closed= 0;
   std::uint64_t operations_opened= 0;
   std::uint64_t fetch_batches= 0;
   std::uint64_t fetched_rows= 0;
+  std::uint64_t positioned_cache_hits= 0;
+  std::uint64_t positioned_fetches= 0;
+  std::uint64_t positioned_rows= 0;
   std::uint64_t arrow_bytes= 0;
   std::uint64_t projected_columns= 0;
   std::uint64_t available_columns= 0;
@@ -47,7 +51,8 @@ public:
   void statement_table_closed();
   void record_projection(std::size_t projected_columns, std::size_t available_columns);
   void record_fetch(std::size_t rows, std::size_t arrow_bytes,
-                    std::uint64_t decode_nanoseconds);
+                    std::uint64_t decode_nanoseconds, bool positioned= false);
+  void record_positioned_cache_hit();
   void record_row_materialize(std::uint64_t nanoseconds);
   void record_native_encode(std::uint64_t nanoseconds);
   bool instrumentation_enabled() const noexcept;

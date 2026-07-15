@@ -292,19 +292,6 @@ void append_masked_byte(std::vector<std::uint8_t> &out,
   ++index;
 }
 
-void append_masked_big_endian(std::vector<std::uint8_t> &out,
-                              const std::array<std::uint8_t, 4> &mask,
-                              std::size_t &index,
-                              std::uint64_t value,
-                              std::size_t size)
-{
-  for (std::size_t i= 0; i < size; ++i)
-  {
-    const unsigned shift= static_cast<unsigned>((size - i - 1U) * 8U);
-    append_masked_byte(out, mask, index, static_cast<std::uint8_t>((value >> shift) & 0xffU));
-  }
-}
-
 void append_masked_payload(std::vector<std::uint8_t> &out,
                            const std::array<std::uint8_t, 4> &mask,
                            std::size_t &index,
@@ -578,11 +565,11 @@ public:
     return parse_open_cursor(frame);
   }
 
+  // Encodes only a forward scan; out-of-band positions have their own message.
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns,
-                                            bool include_row_handles,
-                                            const std::vector<SessionGwRowHandle> &row_handles= {})
+                                            bool include_row_handles)
   {
     std::vector<std::uint8_t> payload;
     append_string32(payload, schema);
@@ -591,9 +578,6 @@ public:
     for (const std::string &column: columns)
       append_string32(payload, column);
     append_u8(payload, include_row_handles ? 1 : 0);
-    append_u32(payload, static_cast<std::uint32_t>(row_handles.size()));
-    for (const SessionGwRowHandle &row_handle: row_handles)
-      append_u64(payload, row_handle.row_number);
     SessionGwFrame frame= request(SessionGwMessageType::open_table_scan,
                                   payload,
                                   SessionGwMessageType::open_cursor_result);
@@ -667,13 +651,44 @@ public:
     (void) request(SessionGwMessageType::rollback, {}, SessionGwMessageType::ok);
   }
 
-  SessionGwFetchResult fetch(std::uint64_t cursor_id, std::uint32_t max_rows, std::uint32_t max_bytes)
+  // Encodes only the fixed sequential-fetch request; positions use a separate message.
+  SessionGwFetchResult fetch(std::uint64_t cursor_id,
+                            std::uint32_t max_rows,
+                            std::uint32_t max_bytes)
   {
     std::vector<std::uint8_t> payload;
     append_u64(payload, cursor_id);
     append_u32(payload, max_rows);
     append_u32(payload, max_bytes);
     SessionGwFrame frame= request(SessionGwMessageType::fetch, payload, SessionGwMessageType::fetch_result);
+    std::size_t offset= 0;
+    SessionGwFetchResult result;
+    result.cursor_id= read_u64(frame.payload, offset);
+    result.end_of_cursor= read_u8(frame.payload, offset) != 0;
+    result.arrow_batch= read_bytes32(frame.payload, offset);
+    if (offset < frame.payload.size())
+    {
+      const std::uint32_t count= read_u32(frame.payload, offset);
+      result.row_handles.reserve(count);
+      for (std::uint32_t i= 0; i < count; ++i)
+        result.row_handles.push_back(SessionGwRowHandle{read_u64(frame.payload, offset)});
+    }
+    return result;
+  }
+
+  // Encodes a vector positioned-read request for the already-open table cursor.
+  SessionGwFetchResult fetch_positioned_rows(std::uint64_t cursor_id,
+                                              const std::vector<SessionGwRowHandle> &row_handles,
+                                              std::uint32_t max_bytes)
+  {
+    if (row_handles.empty())
+      throw std::runtime_error("SessionGW positioned fetch requires at least one row handle");
+    std::vector<std::uint8_t> payload;
+    append_u64(payload, cursor_id);
+    append_u32(payload, max_bytes);
+    append_row_handles(payload, row_handles);
+    SessionGwFrame frame= request(SessionGwMessageType::fetch_positioned_rows, payload,
+                                  SessionGwMessageType::fetch_result);
     std::size_t offset= 0;
     SessionGwFetchResult result;
     result.cursor_id= read_u64(frame.payload, offset);
@@ -1097,20 +1112,27 @@ SessionGwOpenCursorResult SessionGwConnection::open_pushed_query(const std::stri
   return impl_->open_pushed_query(sql);
 }
 
+// Opens one forward scan; positioned reads remain a separate explicit API call.
 SessionGwOpenCursorResult SessionGwConnection::open_table_scan(const std::string &schema,
                                                                const std::string &table,
                                                                const std::vector<std::string> &columns,
-                                                               bool include_row_handles,
-                                                               const std::vector<SessionGwRowHandle> &row_handles)
+                                                               bool include_row_handles)
 {
-  return impl_->open_table_scan(schema, table, columns, include_row_handles, row_handles);
+  return impl_->open_table_scan(schema, table, columns, include_row_handles);
 }
 
-SessionGwFetchResult SessionGwConnection::fetch(std::uint64_t cursor_id,
-                                                std::uint32_t max_rows,
-                                                std::uint32_t max_bytes)
+SessionGwFetchResult SessionGwConnection::fetch(
+    std::uint64_t cursor_id, std::uint32_t max_rows, std::uint32_t max_bytes)
 {
   return impl_->fetch(cursor_id, max_rows, max_bytes);
+}
+
+// Public adapter boundary for explicit logical rows on one existing cursor.
+SessionGwFetchResult SessionGwConnection::fetch_positioned_rows(
+    std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
+    std::uint32_t max_bytes)
+{
+  return impl_->fetch_positioned_rows(cursor_id, row_handles, max_bytes);
 }
 
 void SessionGwConnection::close_cursor(std::uint64_t cursor_id)

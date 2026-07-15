@@ -41,7 +41,8 @@ enum class SessionGwMessageType: std::uint16_t
   open_table_update= 26,
   update_rows= 27,
   open_table_delete= 28,
-  delete_rows= 29
+  delete_rows= 29,
+  fetch_positioned_rows= 30
 };
 
 struct SessionGwFrame
@@ -178,11 +179,11 @@ public:
                                               const std::string &table);
   std::string get_table_version(const std::string &schema, const std::string &table);
   SessionGwOpenCursorResult open_pushed_query(const std::string &sql);
+  // Opens a forward scan; explicit positions use fetch_positioned_rows().
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns,
-                                            bool include_row_handles= false,
-                                            const std::vector<SessionGwRowHandle> &row_handles= {});
+                                            bool include_row_handles= false);
   SessionGwOpenOperationResult open_table_insert(const std::string &schema,
                                                  const std::string &table,
                                                  const std::vector<std::string> &columns,
@@ -208,9 +209,14 @@ public:
   void set_autocommit(bool enabled);
   void commit();
   void rollback();
+  // Fetches only the next sequential Arrow batch from an open cursor.
   SessionGwFetchResult fetch(std::uint64_t cursor_id,
                              std::uint32_t max_rows,
                              std::uint32_t max_bytes= 0);
+  // Fetches explicit logical rows without opening or closing a cursor.
+  SessionGwFetchResult fetch_positioned_rows(
+      std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
+      std::uint32_t max_bytes= 0);
   void close_cursor(std::uint64_t cursor_id);
   const SessionGwClientStatistics &statistics() const noexcept;
 

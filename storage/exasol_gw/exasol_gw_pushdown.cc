@@ -317,36 +317,6 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
   }
 }
 
-int ha_exasol_gw_cursor::open_table_scan_by_row_handle(TABLE *table_arg,
-                                                        const exasol_gw::SessionGwRowHandle &row_handle,
-                                                        char *error_buffer,
-                                                        unsigned long error_buffer_size)
-{
-  try
-  {
-    connection= &session->connection();
-    const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
-    exasol_gw::SessionGwOpenCursorResult opened=
-        connection->open_table_scan(table_schema_name(table_arg),
-                                   table_object_name(table_arg),
-                                   columns,
-                                   false,
-                                   {row_handle});
-    cursor_id= opened.cursor_id;
-    session->read_cursor_opened();
-    cursor_registered= true;
-    current_batch= exasol_gw::ArrowRowBatch();
-    current_row= 0;
-    end_of_cursor= false;
-    return 0;
-  }
-  catch (...)
-  {
-    return copy_current_exception(error_buffer, error_buffer_size,
-                                  "opening EXASOL positioned cursor");
-  }
-}
-
 int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long error_buffer_size)
 {
   try
@@ -378,24 +348,28 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
   }
 }
 
-int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
-                                                    unsigned char *,
-                                                    char *error_buffer,
-                                                    unsigned long error_buffer_size)
+int ha_exasol_gw_cursor::materialize_row(
+    TABLE *table_arg,
+    const exasol_gw::ArrowRowBatch &batch,
+    const std::vector<exasol_gw::SessionGwRowHandle> &row_handles,
+    std::size_t row,
+    unsigned char *,
+    char *error_buffer,
+    unsigned long error_buffer_size)
 {
-  if (!table_arg || current_row >= current_batch.rows)
+  if (!table_arg || row >= batch.rows)
     return HA_ERR_END_OF_FILE;
   try
   {
     const auto materialize_started= options.instrumentation_enabled
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DbugWriteSetGuard write_set_guard(table_arg);
-    if (current_batch.columns.size() != selected_field_indices.size())
+    if (batch.columns.size() != selected_field_indices.size())
       throw std::runtime_error("SessionGW Arrow column count does not match projected MariaDB fields");
     for (std::size_t column= 0; column < selected_field_indices.size(); ++column)
     {
       Field *field= table_arg->field[selected_field_indices[column]];
-      const exasol_gw::ArrowCell &cell= current_batch.columns[column][current_row];
+      const exasol_gw::ArrowCell &cell= batch.columns[column][row];
       if (cell.is_null)
       {
         field->set_null();
@@ -407,9 +381,8 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
         field->store(value.data(), value.size(), &my_charset_bin);
       }
     }
-    if (current_row < current_row_handles.size())
-      last_row_handle_= current_row_handles[current_row];
-    ++current_row;
+    if (row < row_handles.size())
+      last_row_handle_= row_handles[row];
     if (options.instrumentation_enabled)
       session->record_row_materialize(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -421,6 +394,18 @@ int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
     return copy_current_exception(error_buffer, error_buffer_size,
                                   "materializing EXASOL cursor row");
   }
+}
+
+int ha_exasol_gw_cursor::materialize_current_row(TABLE *table_arg,
+                                                    unsigned char *record,
+                                                    char *error_buffer,
+                                                    unsigned long error_buffer_size)
+{
+  const int rc= materialize_row(table_arg, current_batch, current_row_handles, current_row,
+                                record, error_buffer, error_buffer_size);
+  if (rc == 0)
+    ++current_row;
+  return rc;
 }
 
 int ha_exasol_gw_cursor::fetch_row(TABLE *table_arg,
@@ -435,6 +420,50 @@ int ha_exasol_gw_cursor::fetch_row(TABLE *table_arg,
       return rc;
   }
   return materialize_current_row(table_arg, record, error_buffer, error_buffer_size);
+}
+
+int ha_exasol_gw_cursor::fetch_positioned_row(
+    TABLE *table_arg,
+    const exasol_gw::SessionGwRowHandle &row_handle,
+    unsigned char *record,
+    char *error_buffer,
+    unsigned long error_buffer_size)
+{
+  try
+  {
+    for (std::size_t row= 0; row < current_row_handles.size(); ++row)
+    {
+      if (current_row_handles[row].row_number == row_handle.row_number)
+      {
+        session->record_positioned_cache_hit();
+        return materialize_row(table_arg, current_batch, current_row_handles, row,
+                               record, error_buffer, error_buffer_size);
+      }
+    }
+
+    const std::vector<exasol_gw::SessionGwRowHandle> row_handles{row_handle};
+    // A miss is a dedicated vector positioned-read message, never a cursor lifecycle.
+    const exasol_gw::SessionGwFetchResult fetched=
+        connection->fetch_positioned_rows(cursor_id, row_handles);
+    const auto decode_started= options.instrumentation_enabled
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const exasol_gw::ArrowRowBatch batch=
+        exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
+    const std::uint64_t decode_nanoseconds= options.instrumentation_enabled
+        ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - decode_started).count()) : 0U;
+    session->record_fetch(batch.rows, fetched.arrow_batch.size(), decode_nanoseconds, true);
+    if (batch.rows == 0)
+      return HA_ERR_END_OF_FILE;
+    if (batch.rows != 1)
+      throw std::runtime_error("SessionGW positioned fetch returned an unexpected row count");
+    return materialize_row(table_arg, batch, row_handles, 0, record, error_buffer, error_buffer_size);
+  }
+  catch (...)
+  {
+    return copy_current_exception(error_buffer, error_buffer_size,
+                                  "fetching EXASOL positioned row");
+  }
 }
 
 int ha_exasol_gw_cursor::close(char *error_buffer, unsigned long error_buffer_size)

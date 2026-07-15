@@ -317,7 +317,18 @@ public:
       {
         my_error(ER_GET_ERRNO, MYF(0), rc,
                  error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW table row");
+        return rc;
       }
+      DBUG_EXECUTE_IF("exasol_gw_positioned_cache_hit",
+      {
+        if (rc == 0 && ref)
+        {
+          position(buf);
+          const int positioned_rc= rnd_pos(buf, ref);
+          if (positioned_rc != 0)
+            return positioned_rc;
+        }
+      });
       return rc;
     }
     catch (...)
@@ -333,26 +344,18 @@ public:
       const int validation_rc= validate_remote_metadata();
       if (validation_rc != 0)
         return validation_rc;
+      if (!cursor)
+        return HA_ERR_RECORD_DELETED;
       const exasol_gw::SessionGwRowHandle row_handle= row_handle_from_ref(pos);
-      ha_exasol_gw_cursor positioned_cursor(table->in_use);
       char error_buffer[512]= {0};
-      const int open_rc= positioned_cursor.open_table_scan_by_row_handle(table,
-                                                                         row_handle,
-                                                                         error_buffer,
-                                                                         sizeof(error_buffer));
-      if (open_rc != 0)
-      {
-        my_error(ER_GET_ERRNO, MYF(0), open_rc,
-                 error_buffer[0] ? error_buffer : "failed to open EXASOL SessionGW positioned scan");
-        return open_rc;
-      }
-      const int fetch_rc= positioned_cursor.fetch_row(table, buf, error_buffer, sizeof(error_buffer));
+      const int fetch_rc= cursor->fetch_positioned_row(table, row_handle, buf,
+                                                        error_buffer, sizeof(error_buffer));
       if (fetch_rc != 0)
       {
         if (fetch_rc == HA_ERR_END_OF_FILE)
           return HA_ERR_RECORD_DELETED;
         my_error(ER_GET_ERRNO, MYF(0), fetch_rc,
-                 error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW positioned row");
+                 error_buffer[0] ? error_buffer : "failed to fetch EXASOL SessionGW positioned row from initialized cursor");
         return fetch_rc;
       }
       last_positioned_row_handle= row_handle;
