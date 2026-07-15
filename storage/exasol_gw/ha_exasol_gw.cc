@@ -493,13 +493,16 @@ CHARSET_INFO *declared_field_charset(Field *field, Create_field *create_field)
   return create_field && create_field->charset ? create_field->charset : field->charset();
 }
 
-bool is_exasol_utf8_charset(const CHARSET_INFO *charset)
+bool is_supported_exasol_string_collation(const CHARSET_INFO *charset,
+                                           const CHARSET_INFO *implicit_collation)
 {
-  return charset && charset->cs_name.str &&
-         std::string(charset->cs_name.str, charset->cs_name.length) == "utf8mb4";
+  return charset && charset == implicit_collation && charset->cs_name.str &&
+         std::string(charset->cs_name.str, charset->cs_name.length) == "utf8mb4" &&
+         (charset->state & MY_CS_BINSORT) == 0;
 }
 
 bool append_exasol_type(Field *field, Create_field *create_field,
+                        const CHARSET_INFO *implicit_collation,
                         std::string *sql, std::string *error)
 {
   const enum_field_types type= declared_field_type(field, create_field);
@@ -524,7 +527,7 @@ bool append_exasol_type(Field *field, Create_field *create_field,
       *error= "unsigned BIGINT is not supported for EXASOL field '" + field_name(field) + "'";
       return false;
     }
-    *sql += "DECIMAL(18,0)";
+    *sql += "DECIMAL(19,0)";
     return true;
   case MYSQL_TYPE_YEAR:
     *sql += "DECIMAL(4,0)";
@@ -570,10 +573,11 @@ bool append_exasol_type(Field *field, Create_field *create_field,
   case MYSQL_TYPE_VAR_STRING:
   case MYSQL_TYPE_VARCHAR:
   {
-    if (!is_exasol_utf8_charset(declared_field_charset(field, create_field)))
+    if (!is_supported_exasol_string_collation(
+            declared_field_charset(field, create_field), implicit_collation))
     {
-      *error= "non-UTF8 string charset is not supported for EXASOL field '" +
-              field_name(field) + "'";
+      *error= "non-default, binary, or non-UTF8 string collation is not supported for "
+              "EXASOL field '" + field_name(field) + "'";
       return false;
     }
     const uint length= declared_field_char_length(field, create_field);
@@ -639,6 +643,8 @@ bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
   List_iterator_fast<Create_field> create_fields(
       create_info && create_info->alter_info ? create_info->alter_info->create_list : empty_fields);
   const bool have_create_fields= create_info && create_info->alter_info;
+  const CHARSET_INFO *implicit_collation=
+      form->in_use ? form->in_use->variables.collation_server : nullptr;
   bool first= true;
   for (Field **field= form->field; *field; ++field)
   {
@@ -653,7 +659,7 @@ bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
       *sql += ", ";
     first= false;
     *sql += quote_exasol_identifier(field_name(*field)) + " ";
-    if (!append_exasol_type(*field, create_field, sql, error))
+    if (!append_exasol_type(*field, create_field, implicit_collation, sql, error))
       return false;
     *sql += ((*field)->flags & NOT_NULL_FLAG) != 0 ? " NOT NULL" : " NULL";
   }
@@ -692,7 +698,7 @@ LocalColumnDescription local_column_description(Field *field)
     break;
   case MYSQL_TYPE_LONGLONG:
     result.type_id= "DTM_decimal";
-    result.precision= 18;
+    result.precision= 19;
     break;
   case MYSQL_TYPE_YEAR:
     result.type_id= "DTM_decimal";
@@ -898,10 +904,15 @@ bool append_field_to_column_buffer(NativeColumnBuffer &column, Field *field)
   case MYSQL_TYPE_SHORT:
   case MYSQL_TYPE_LONG:
   case MYSQL_TYPE_INT24:
-  case MYSQL_TYPE_LONGLONG:
   case MYSQL_TYPE_YEAR:
   {
     const std::int64_t value= field->is_null() ? 0 : static_cast<std::int64_t>(field->val_int());
+    append_fixed_value(column.fixed, &value, sizeof(value));
+    return true;
+  }
+  case MYSQL_TYPE_LONGLONG:
+  {
+    const __int128_t value= field->is_null() ? 0 : static_cast<__int128_t>(field->val_int());
     append_fixed_value(column.fixed, &value, sizeof(value));
     return true;
   }

@@ -136,6 +136,10 @@ expect_failure_contains() {
     log "PASS contained exception: $label"
 }
 
+expect_handler_unsupported() {
+    expect_failure_contains "$1" "$2" 'Got error 138 "Unsupported extension used for table"'
+}
+
 expect_exasol_failure() {
     local label=$1
     local sql=$2
@@ -432,21 +436,29 @@ expect_scalar "prepared statement count" \
 
 expect_failure "unsupported key definition" \
     "USE $SCHEMA; CREATE TABLE BAD_KEY(ID INT, KEY(ID)) ENGINE=EXASOL"
-expect_failure "unsupported default clause" \
+expect_handler_unsupported "unsupported default clause" \
     "USE $SCHEMA; CREATE TABLE BAD_DEFAULT(ID INT DEFAULT 1) ENGINE=EXASOL"
 expect_failure "unsupported auto increment" \
     "USE $SCHEMA; CREATE TABLE BAD_AUTO(ID INT AUTO_INCREMENT PRIMARY KEY) ENGINE=EXASOL"
-expect_failure "unsupported binary string" \
+expect_handler_unsupported "unsupported binary string" \
     "USE $SCHEMA; CREATE TABLE BAD_BINARY(B BINARY(8)) ENGINE=EXASOL"
-expect_failure "unsupported multi-bit value" \
+expect_handler_unsupported "unsupported multi-bit value" \
     "USE $SCHEMA; CREATE TABLE BAD_BIT(B BIT(2)) ENGINE=EXASOL"
-expect_failure "unsupported explicit table charset" \
+expect_handler_unsupported "unsupported explicit table charset" \
     "USE $SCHEMA; CREATE TABLE BAD_CHARSET(V VARCHAR(8)) ENGINE=EXASOL DEFAULT CHARSET=latin1"
-expect_failure "unsupported alter table" \
+expect_handler_unsupported "unsupported per-column charset" \
+    "USE $SCHEMA; CREATE TABLE BAD_COLUMN_CHARSET(V VARCHAR(8) CHARACTER SET latin1) ENGINE=EXASOL"
+expect_handler_unsupported "unsupported explicit binary collation" \
+    "USE $SCHEMA; CREATE TABLE BAD_COLUMN_COLLATION(V VARCHAR(8) COLLATE utf8mb4_bin) ENGINE=EXASOL"
+expect_handler_unsupported "unsupported explicit non-default collation" \
+    "USE $SCHEMA; CREATE TABLE BAD_COLUMN_COLLATION_CI(V VARCHAR(8) COLLATE utf8mb4_general_ci) ENGINE=EXASOL"
+expect_handler_unsupported "unsupported varchar binary semantics" \
+    "USE $SCHEMA; CREATE TABLE BAD_COLUMN_BINARY(V VARCHAR(8) BINARY) ENGINE=EXASOL"
+expect_handler_unsupported "unsupported alter table" \
     "USE $SCHEMA; ALTER TABLE T ADD COLUMN EXTRA INT"
-expect_failure "unsupported truncate table" \
+expect_handler_unsupported "unsupported truncate table" \
     "USE $SCHEMA; TRUNCATE TABLE T"
-expect_failure "unsupported rename table" \
+expect_handler_unsupported "unsupported rename table" \
     "USE $SCHEMA; RENAME TABLE T TO T_RENAMED"
 expect_scalar "rejected DDL preserved table rows" "USE $SCHEMA; SELECT COUNT(*) FROM T" "3"
 REJECTED_TABLES=$(sql_exasol "select count(*) from sys.exa_all_tables where table_schema='$SCHEMA' and table_name like 'BAD_%'")
@@ -468,6 +480,16 @@ sql_exasol "INSERT INTO $SCHEMA.NULLABILITY_GUARD VALUES (1, NULL)" >/dev/null
 expect_scalar "nullable column mapping" \
     "USE $SCHEMA; SELECT COUNT(*) FROM NULLABILITY_GUARD WHERE OPTIONAL_NAME IS NULL" "1"
 log "PASS nullability mapped to Exasol"
+
+mysql -e "USE $SCHEMA; CREATE TABLE BIGINT_GUARD(ID BIGINT NOT NULL) ENGINE=EXASOL; INSERT INTO BIGINT_GUARD VALUES (-9223372036854775808), (9223372036854775807)"
+expect_scalar "signed BIGINT boundary round trip" \
+    "USE $SCHEMA; SELECT CONCAT(MIN(ID), '|', MAX(ID)) FROM BIGINT_GUARD" \
+    "-9223372036854775808|9223372036854775807"
+BIGINT_REMOTE_TYPE=$(sql_exasol "select column_type from sys.exa_all_columns where column_schema='$SCHEMA' and column_table='BIGINT_GUARD' and column_name='ID'")
+echo "$BIGINT_REMOTE_TYPE" | tee -a "$REPORT" | grep -q '"data":\[\["DECIMAL(19,0)"\]\]'
+BIGINT_REMOTE=$(sql_exasol "select min(id), max(id) from $SCHEMA.BIGINT_GUARD")
+echo "$BIGINT_REMOTE" | tee -a "$REPORT" | grep -Eq '"data":\[\["?-9223372036854775808"?\],\["?9223372036854775807"?\]\]'
+log "PASS signed BIGINT uses DECIMAL(19,0) and preserves boundaries"
 
 mysql -e "USE $SCHEMA; CREATE TABLE ABORT_GUARD(ID INT, NAME VARCHAR(8) NULL) ENGINE=EXASOL"
 sql_exasol "DROP TABLE $SCHEMA.ABORT_GUARD" >/dev/null
