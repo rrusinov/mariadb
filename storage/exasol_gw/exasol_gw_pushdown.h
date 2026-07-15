@@ -91,7 +91,7 @@ public:
   ha_exasol_gw_derived_handler(THD *thd_arg, TABLE_LIST *derived_arg, TABLE *tbl_arg);
   ~ha_exasol_gw_derived_handler() override;
 
-  int init_scan() override { return init_scan_(thd, table, query.ptr(), false); }
+  int init_scan() override;
   int next_row() override { return next_row_(table); }
   int end_scan() override { return end_scan_(); }
 

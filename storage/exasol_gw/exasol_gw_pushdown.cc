@@ -591,7 +591,29 @@ ha_exasol_gw_derived_handler::ha_exasol_gw_derived_handler(THD *thd_arg,
   set_query_from_generated_sql(&query, &query_generation_error, generated);
 }
 
-ha_exasol_gw_derived_handler::~ha_exasol_gw_derived_handler()= default;
+ha_exasol_gw_derived_handler::~ha_exasol_gw_derived_handler()
+{
+  // MariaDB may destroy a derived handler immediately after init_scan()
+  // fails, without calling end_scan(). Keep cursor ownership symmetric with
+  // the select handler so every early-delete path closes remote accounting.
+  (void) end_scan_();
+}
+
+int ha_exasol_gw_derived_handler::init_scan()
+{
+  try
+  {
+    const int rc= init_scan_(thd, table, query.ptr(), false);
+    if (rc != 0)
+      return rc;
+    DBUG_EXECUTE_IF("exasol_gw_derived_after_cursor_open_oom", throw std::bad_alloc(););
+    return 0;
+  }
+  catch (...)
+  {
+    return report_pushdown_exception("initializing EXASOL derived pushdown");
+  }
+}
 
 ha_exasol_gw_select_handler::ha_exasol_gw_select_handler(
     THD *thd_arg, SELECT_LEX_UNIT *lex_unit, TABLE *tbl)

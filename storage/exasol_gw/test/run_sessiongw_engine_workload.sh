@@ -25,6 +25,7 @@ PERF_INSERT_BATCH_ROWS=${PERF_INSERT_BATCH_ROWS:-10000}
 PERF_UPDATE_ROWS=${PERF_UPDATE_ROWS:-$((PERF_ROWS / 10))}
 PERF_DELETE_ROWS=${PERF_DELETE_ROWS:-$((PERF_ROWS / 20))}
 FAULT_INJECTION_ONLY=${FAULT_INJECTION_ONLY:-0}
+FAULT_TIMEOUT_SECONDS=${FAULT_TIMEOUT_SECONDS:-20}
 POSITIONED_DML_TEST_ONLY=${POSITIONED_DML_TEST_ONLY:-0}
 POSITIONED_DML_BATCH_ROWS=${POSITIONED_DML_BATCH_ROWS:-3}
 SESSIONGW_FETCH_ROWS=${EXASOL_SESSIONGW_FETCH_ROWS:-1024}
@@ -134,6 +135,73 @@ expect_failure_contains() {
         exit 1
     fi
     log "PASS contained exception: $label"
+}
+
+mysql_timed() {
+    timeout --foreground --signal=KILL "${FAULT_TIMEOUT_SECONDS}s" \
+        "$MARIADB_BUILD/client/mariadb" --no-defaults --local-infile=1 --socket="$SOCKET" "$@"
+}
+
+expect_timed_failure_contains() {
+    local label=$1
+    local sql=$2
+    local expected=$3
+    local output="$BASE_DIR/${label//[^A-Za-z0-9_]/_}.out"
+    local rc=0
+    mysql_timed -e "$sql" >"$output" 2>&1 || rc=$?
+    if (( rc == 0 )); then
+        echo "Expected failure for $label but command succeeded" >&2
+        exit 1
+    fi
+    if (( rc == 124 || rc == 137 )); then
+        echo "Timed out after ${FAULT_TIMEOUT_SECONDS}s while testing $label" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+    if ! grep -Fq "$expected" "$output"; then
+        echo "Failure for $label did not contain '$expected'" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+    log "PASS bounded contained exception: $label"
+}
+
+expect_timed_scalar() {
+    local label=$1
+    local sql=$2
+    local expected=$3
+    local actual
+    actual=$(mysql_timed --batch --raw --skip-column-names -e "$sql" | tail -n 1)
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Unexpected $label: expected '$expected' got '$actual'" >&2
+        exit 1
+    fi
+    log "PASS bounded reuse: $label = $actual"
+}
+
+expect_one_balanced_cursor_metric() {
+    local label=$1
+    local before=$2
+    local after metrics
+    after=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    if (( after != before + 1 )); then
+        echo "Expected one SessionGW metric record for $label, got $((after - before))" >&2
+        exit 1
+    fi
+    metrics=$(grep 'SessionGW performance:' "$MDB/mariadb.err" | tail -n 1)
+    python3 - "$label" "$metrics" <<'PY'
+import re
+import sys
+label, line = sys.argv[1:]
+values = {name: int(value) for name, value in re.findall(r"([a-z_]+)=([0-9]+)", line)}
+for name in ("cursors_opened", "cursors_closed"):
+    if name not in values:
+        raise SystemExit(f"{label}: missing {name} in SessionGW performance record")
+if values["cursors_opened"] != 1 or values["cursors_closed"] != 1:
+    raise SystemExit(f"{label}: expected one balanced cursor lifecycle, got {values}")
+print(f"{label}: cursors_opened=1 cursors_closed=1")
+PY
+    log "PASS early-destruction cursor cleanup $label: $metrics"
 }
 
 expect_handler_unsupported() {
@@ -324,9 +392,14 @@ mysql -e "USE $SCHEMA; DROP TABLE META_GUARD" >/dev/null
 log "PASS remote metadata compatibility and generation invalidation"
 
 if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
-    expect_failure_contains "cursor constructor allocation fault" \
+    expect_failure_contains "pushdown cursor constructor allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_cursor_constructor_oom'; USE $SCHEMA; SELECT * FROM T" \
         "out of memory"
+    expect_timed_failure_contains "table scan cursor constructor allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_table_scan_cursor_constructor_oom'; USE $SCHEMA; UPDATE T SET NAME=NAME WHERE ID=1" \
+        "out of memory"
+    expect_timed_scalar "table scan cursor failure preserves reuse" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM T" "3"
     expect_failure_contains "insert context constructor allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_insert_context_constructor_oom'; USE $SCHEMA; INSERT INTO T VALUES (10, 'fault')" \
         "out of memory"
@@ -336,6 +409,29 @@ if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
     expect_failure_contains "delete context constructor allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_delete_context_constructor_oom'; USE $SCHEMA; DELETE FROM T WHERE ID=1" \
         "out of memory"
+
+    mysql -e "USE $SCHEMA; CREATE TABLE SHARE_LOCK_GUARD(ID INT) ENGINE=EXASOL; FLUSH TABLE SHARE_LOCK_GUARD"
+    expect_timed_failure_contains "table share construction allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_share_constructor_oom'; USE $SCHEMA; SELECT COUNT(*) FROM SHARE_LOCK_GUARD" \
+        "out of memory"
+    expect_timed_scalar "table share lock released after allocation fault" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM SHARE_LOCK_GUARD" "0"
+
+    expect_timed_failure_contains "metadata version critical-section allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_metadata_version_assignment_oom'; USE $SCHEMA; SELECT COUNT(*) FROM T" \
+        "out of memory"
+    expect_timed_scalar "metadata mutex released after allocation fault" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM T" "3"
+
+    mysql -e "USE $SCHEMA; CREATE TABLE DERIVED_DEST(ID BIGINT) ENGINE=InnoDB; INSERT INTO DERIVED_DEST VALUES (1)"
+    DERIVED_METRICS_BEFORE=$(grep -c 'SessionGW performance:' "$MDB/mariadb.err" || true)
+    expect_timed_failure_contains "derived handler early destruction allocation fault" \
+        "SET SESSION debug_dbug='+d,exasol_gw_derived_after_cursor_open_oom'; USE $SCHEMA; SELECT * FROM DERIVED_DEST AS L, (SELECT ID FROM T LIMIT 2) AS D" \
+        "out of memory"
+    expect_one_balanced_cursor_metric "derived handler early destruction" "$DERIVED_METRICS_BEFORE"
+    expect_timed_scalar "derived handler failure preserves reuse" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM T" "3"
+
     expect_scalar "constructor faults preserve server and rows" \
         "USE $SCHEMA; SELECT CONCAT(COUNT(*), '|', MIN(NAME)) FROM T" "3|Alice"
 else

@@ -89,6 +89,26 @@ int report_handler_exception(const char *operation) noexcept
     return HA_ERR_INTERNAL_ERROR;
   }
 }
+
+class MysqlMutexGuard
+{
+public:
+  explicit MysqlMutexGuard(mysql_mutex_t *mutex_arg): mutex(mutex_arg)
+  {
+    mysql_mutex_lock(mutex);
+  }
+
+  ~MysqlMutexGuard()
+  {
+    mysql_mutex_unlock(mutex);
+  }
+
+  MysqlMutexGuard(const MysqlMutexGuard &)= delete;
+  MysqlMutexGuard &operator=(const MysqlMutexGuard &)= delete;
+
+private:
+  mysql_mutex_t *mutex;
+};
 }
 
 class Exasol_gw_share: public Handler_share
@@ -258,6 +278,8 @@ public:
       if (validation_rc != 0)
         return validation_rc;
       have_positioned_row_handle= false;
+      DBUG_EXECUTE_IF("exasol_gw_table_scan_cursor_constructor_oom",
+                      throw std::bad_alloc(););
       cursor= new ha_exasol_gw_cursor(table->in_use);
       if (!cursor)
         return HA_ERR_OUT_OF_MEM;
@@ -405,11 +427,24 @@ private:
   {
     lock_shared_ha_data();
     auto *result= static_cast<Exasol_gw_share *>(get_ha_share_ptr());
+    unlock_shared_ha_data();
+    if (result)
+      return result;
+
+    // Construct outside LOCK_ha_data: allocation and member construction may
+    // throw, and no MariaDB mutex may remain held while the handler translates
+    // that failure into HA_ERR_OUT_OF_MEM.
+    DBUG_EXECUTE_IF("exasol_gw_share_constructor_oom", throw std::bad_alloc(););
+    std::unique_ptr<Exasol_gw_share> candidate(new Exasol_gw_share());
+
+    // Another opener may have installed the shared object while this one was
+    // allocating. Only non-throwing pointer operations happen under the lock.
+    lock_shared_ha_data();
+    result= static_cast<Exasol_gw_share *>(get_ha_share_ptr());
     if (!result)
     {
-      result= new Exasol_gw_share();
-      if (result)
-        set_ha_share_ptr(static_cast<Handler_share *>(result));
+      result= candidate.release();
+      set_ha_share_ptr(static_cast<Handler_share *>(result));
     }
     unlock_shared_ha_data();
     return result;
@@ -1639,13 +1674,19 @@ int ha_exasol_gw::validate_remote_metadata()
     }
   }
 
+  // Copy before locking because std::string allocation can throw. Swapping an
+  // already-built value below is noexcept, and the guard also protects against
+  // injected failures in the critical section.
+  std::string initial_table_version= described.table_version;
   bool version_changed= false;
-  mysql_mutex_lock(&share->mutex);
-  if (share->remote_table_version.empty())
-    share->remote_table_version= described.table_version;
-  else
-    version_changed= share->remote_table_version != described.table_version;
-  mysql_mutex_unlock(&share->mutex);
+  {
+    MysqlMutexGuard guard(&share->mutex);
+    DBUG_EXECUTE_IF("exasol_gw_metadata_version_assignment_oom", throw std::bad_alloc(););
+    if (share->remote_table_version.empty())
+      share->remote_table_version.swap(initial_table_version);
+    else
+      version_changed= share->remote_table_version != described.table_version;
+  }
   if (version_changed)
     throw std::runtime_error(
         "Remote EXASOL table was changed or replaced; recreate the MariaDB table definition");
