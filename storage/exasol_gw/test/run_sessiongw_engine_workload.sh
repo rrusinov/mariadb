@@ -410,6 +410,24 @@ if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
         "SET SESSION debug_dbug='+d,exasol_gw_delete_context_constructor_oom'; USE $SCHEMA; DELETE FROM T WHERE ID=1" \
         "out of memory"
 
+    mysql -e "USE $SCHEMA; CREATE TABLE DML_ABORT_GUARD(ID INT, NAME VARCHAR(20)) ENGINE=EXASOL; INSERT INTO DML_ABORT_GUARD VALUES (1, 'one'), (2, 'two')"
+    expect_failure_contains "insert failure after completed batch preserves original error" \
+        "SET SESSION debug_dbug='+d,exasol_gw_dml_batch_one,exasol_gw_insert_after_batch_error'; USE $SCHEMA; INSERT INTO DML_ABORT_GUARD VALUES (3, 'three'), (4, 'four')" \
+        "injected insert failure after a completed SessionGW batch"
+    expect_scalar "failed insert commits no completed-batch prefix" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM DML_ABORT_GUARD" "2"
+    expect_failure_contains "update failure after completed batch preserves original error" \
+        "SET SESSION debug_dbug='+d,exasol_gw_dml_batch_one,exasol_gw_update_after_batch_error'; USE $SCHEMA; UPDATE DML_ABORT_GUARD SET NAME='changed' ORDER BY ID" \
+        "injected update failure after a completed SessionGW batch"
+    expect_scalar "failed update commits no completed-batch prefix" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM DML_ABORT_GUARD WHERE NAME='changed'" "0"
+    expect_failure_contains "delete failure after completed batch preserves original error" \
+        "SET SESSION debug_dbug='+d,exasol_gw_dml_batch_one,exasol_gw_delete_after_batch_error'; USE $SCHEMA; DELETE FROM DML_ABORT_GUARD ORDER BY ID" \
+        "injected delete failure after a completed SessionGW batch"
+    expect_scalar "failed delete commits no completed-batch prefix" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM DML_ABORT_GUARD" "2"
+    log "PASS failed insert/update/delete CLEAN-abort completed prefixes and preserve original errors"
+
     mysql -e "USE $SCHEMA; CREATE TABLE SHARE_LOCK_GUARD(ID INT) ENGINE=EXASOL; FLUSH TABLE SHARE_LOCK_GUARD"
     expect_timed_failure_contains "table share construction allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_share_constructor_oom'; USE $SCHEMA; SELECT COUNT(*) FROM SHARE_LOCK_GUARD" \

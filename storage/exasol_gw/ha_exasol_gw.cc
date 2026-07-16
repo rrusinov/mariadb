@@ -454,6 +454,7 @@ private:
   int close_update_context();
   int close_delete_context();
   int close_dml_contexts();
+  void abort_dml_contexts() noexcept;
 
   THR_LOCK_DATA lock;
   Exasol_gw_share *share;
@@ -1093,6 +1094,7 @@ struct InsertContext
       max_rows_per_batch(max_rows)
   {
     DBUG_EXECUTE_IF("exasol_gw_insert_context_constructor_oom", throw std::bad_alloc(););
+    DBUG_EXECUTE_IF("exasol_gw_dml_batch_one", max_rows_per_batch= 1;);
   }
 
   int append(TABLE *table)
@@ -1200,6 +1202,11 @@ struct InsertContext
         return HA_ERR_INTERNAL_ERROR;
       }
       reset_pending();
+      DBUG_EXECUTE_IF("exasol_gw_insert_after_batch_error",
+        abort();
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+                 "injected insert failure after a completed SessionGW batch");
+        return HA_ERR_INTERNAL_ERROR;);
       return 0;
     }
     catch (const exasol_gw::SessionGwError &error)
@@ -1280,6 +1287,7 @@ struct UpdateContext
       max_rows_per_batch(max_rows)
   {
     DBUG_EXECUTE_IF("exasol_gw_update_context_constructor_oom", throw std::bad_alloc(););
+    DBUG_EXECUTE_IF("exasol_gw_dml_batch_one", max_rows_per_batch= 1;);
   }
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
@@ -1386,6 +1394,11 @@ struct UpdateContext
         return HA_ERR_KEY_NOT_FOUND;
       }
       reset_pending();
+      DBUG_EXECUTE_IF("exasol_gw_update_after_batch_error",
+        abort();
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+                 "injected update failure after a completed SessionGW batch");
+        return HA_ERR_INTERNAL_ERROR;);
       return 0;
     }
     catch (const exasol_gw::SessionGwError &error)
@@ -1477,6 +1490,7 @@ struct DeleteContext
       max_rows_per_batch(max_rows)
   {
     DBUG_EXECUTE_IF("exasol_gw_delete_context_constructor_oom", throw std::bad_alloc(););
+    DBUG_EXECUTE_IF("exasol_gw_dml_batch_one", max_rows_per_batch= 1;);
   }
 
   int append(TABLE *table, const exasol_gw::SessionGwRowHandle &row_handle)
@@ -1548,6 +1562,11 @@ struct DeleteContext
         return HA_ERR_KEY_NOT_FOUND;
       }
       pending_handles.clear();
+      DBUG_EXECUTE_IF("exasol_gw_delete_after_batch_error",
+        abort();
+        my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR,
+                 "injected delete failure after a completed SessionGW batch");
+        return HA_ERR_INTERNAL_ERROR;);
       return 0;
     }
     catch (const exasol_gw::SessionGwError &error)
@@ -1624,18 +1643,11 @@ struct DeleteContext
 
 ha_exasol_gw::~ha_exasol_gw()
 {
-  try
-  {
-    (void) close_dml_contexts();
-    delete cursor;
-  }
-  catch (...)
-  {
-    delete insert_context;
-    delete update_context;
-    delete delete_context;
-    delete cursor;
-  }
+  // Handler destruction is cleanup, never a successful statement boundary.
+  // FINISH here could commit buffered rows after MariaDB had already failed the
+  // statement, so abandon every live operation and preserve the original error.
+  abort_dml_contexts();
+  delete cursor;
 }
 
 int ha_exasol_gw::validate_remote_metadata()
@@ -1723,6 +1735,11 @@ int ha_exasol_gw::end_bulk_insert()
 {
   try
   {
+    if (table->in_use->is_error())
+    {
+      abort_dml_contexts();
+      return 0;
+    }
     return close_insert_context();
   }
   catch (...)
@@ -1738,6 +1755,13 @@ int ha_exasol_gw::external_lock(THD *thd, int lock_type)
     if (lock_type != F_UNLCK)
     {
       exasol_gw::session_for_thd(thd).statement_table_opened();
+      return 0;
+    }
+
+    if (thd->is_error())
+    {
+      abort_dml_contexts();
+      // Do not replace MariaDB's original statement error with cleanup status.
       return 0;
     }
 
@@ -1776,6 +1800,44 @@ int ha_exasol_gw::close_delete_context()
   std::unique_ptr<DeleteContext> context(delete_context);
   delete_context= nullptr;
   return context->close(table);
+}
+
+void ha_exasol_gw::abort_dml_contexts() noexcept
+{
+  // One reset closes the physical SessionGW connection and CLEAN-aborts all
+  // server-side operations. Calling abort on each context is intentional: it
+  // also clears every local pending vector and marks it non-finishable.
+  try
+  {
+    if (insert_context)
+      insert_context->abort();
+  }
+  catch (...)
+  {
+  }
+  try
+  {
+    if (update_context)
+      update_context->abort();
+  }
+  catch (...)
+  {
+  }
+  try
+  {
+    if (delete_context)
+      delete_context->abort();
+  }
+  catch (...)
+  {
+    // Cleanup must not overwrite the statement diagnostic area.
+  }
+  delete insert_context;
+  delete update_context;
+  delete delete_context;
+  insert_context= nullptr;
+  update_context= nullptr;
+  delete_context= nullptr;
 }
 
 int ha_exasol_gw::close_dml_contexts()
