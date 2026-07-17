@@ -832,25 +832,26 @@ std::uint32_t native_date_value(const std::uint32_t year,
   return (year << 16U) | (month << 8U) | day;
 }
 
+MYSQL_TIME native_temporal_value(Field *field)
+{
+  MYSQL_TIME value{};
+  if (field->get_date(&value, date_mode_t(0)))
+    throw std::runtime_error("invalid MariaDB temporal value for EXASOL native write");
+  return value;
+}
+
 std::uint32_t parse_native_date(Field *field)
 {
-  const longlong value= field->val_int();
-  const std::uint32_t day= static_cast<std::uint32_t>(value % 100);
-  const std::uint32_t month= static_cast<std::uint32_t>((value / 100) % 100);
-  const std::uint32_t year= static_cast<std::uint32_t>(value / 10000);
-  return native_date_value(year, month, day);
+  const MYSQL_TIME value= native_temporal_value(field);
+  return native_date_value(value.year, value.month, value.day);
 }
 
 ExasolNativeTimestamp parse_native_timestamp(Field *field)
 {
-  const longlong value= field->val_int();
-  const std::uint32_t second= static_cast<std::uint32_t>(value % 100);
-  const std::uint32_t minute= static_cast<std::uint32_t>((value / 100) % 100);
-  const std::uint32_t hour= static_cast<std::uint32_t>((value / 10000) % 100);
-  const std::uint32_t day= static_cast<std::uint32_t>((value / 1000000) % 100);
-  const std::uint32_t month= static_cast<std::uint32_t>((value / 100000000) % 100);
-  const std::uint32_t year= static_cast<std::uint32_t>(value / 10000000000LL);
-  return {0U, hour * 3600U + minute * 60U + second, native_date_value(year, month, day), 0U};
+  const MYSQL_TIME value= native_temporal_value(field);
+  return {static_cast<std::uint32_t>(value.second_part) * 1000U,
+          value.hour * 3600U + value.minute * 60U + value.second,
+          native_date_value(value.year, value.month, value.day), 0U};
 }
 
 __int128_t parse_scaled_decimal(Field *field)
