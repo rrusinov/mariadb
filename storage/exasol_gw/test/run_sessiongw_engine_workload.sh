@@ -681,6 +681,21 @@ fi
 log "PASS type update final $TYPE_UPD_FINAL"
 log "PASS supported type matrix"
 
+mysql -e "USE $SCHEMA;
+  CREATE TABLE SPARSE_UPD(ID INT, KEEP_COL VARCHAR(20), NULLABLE_COL VARCHAR(20), VALUE_COL INT) ENGINE=EXASOL;
+  INSERT INTO SPARSE_UPD VALUES (1, 'keep_1', 'before_1', 10), (2, 'keep_2', 'before_2', 20);
+  UPDATE SPARSE_UPD
+     SET NULLABLE_COL=CASE WHEN ID=1 THEN NULL ELSE 'changed_2' END,
+         VALUE_COL=VALUE_COL+1;"
+SPARSE_FINAL=$(mysql --batch --raw --skip-column-names -e \
+  "USE $SCHEMA; SELECT ID, KEEP_COL, COALESCE(NULLABLE_COL, 'NULL'), VALUE_COL FROM SPARSE_UPD ORDER BY ID" \
+  | tr '\t' '|' | paste -sd';' -)
+if [[ "$SPARSE_FINAL" != "1|keep_1|NULL|11;2|keep_2|changed_2|21" ]]; then
+    echo "Unexpected sparse update state: $SPARSE_FINAL" >&2
+    exit 1
+fi
+log "PASS sparse mixed-null update $SPARSE_FINAL"
+
 LOAD_FILE=$BASE_DIR/load_data.csv
 printf '20,LoadA\n21,LoadB\n22,LoadC\n' > "$LOAD_FILE"
 mysql --table <<SQL | tee -a "$REPORT"
@@ -713,6 +728,33 @@ perf_start=$(date +%s)
 insert_start=$(date +%s)
 mysql --table < "$PERF_SQL" | tee -a "$REPORT"
 insert_end=$(date +%s)
+
+# One statement, one update operation, and repeated native vectors over 100k+
+# rows. Two sparse columns change, NULL/non-NULL values share batches, and the
+# omitted column proves the full-row fallback is gone.
+sparse_scale_start=$(date +%s)
+mysql --table -e "USE $SCHEMA;
+  UPDATE PERF_T
+     SET ID=ID,
+         NAME=CASE WHEN MOD(ID, 2)=0 THEN NULL ELSE CONCAT('Sparse_', ID) END;
+  SELECT COUNT(*) AS C,
+         COUNT(CASE WHEN NAME IS NULL THEN 1 END) AS N,
+         COUNT(CASE WHEN NAME LIKE 'Sparse_%' THEN 1 END) AS V
+    FROM PERF_T;" | tee -a "$REPORT"
+sparse_scale_end=$(date +%s)
+expected_sparse_nulls=$((PERF_ROWS / 2))
+expected_sparse_values=$((PERF_ROWS - expected_sparse_nulls))
+expected_sparse_id_sum=$((PERF_ROWS * (PERF_ROWS + 1) / 2))
+SPARSE_SCALE_FINAL=$(mysql --batch --raw --skip-column-names -e \
+  "USE $SCHEMA; SELECT COUNT(*), COUNT(CASE WHEN NAME IS NULL THEN 1 END), COUNT(CASE WHEN NAME LIKE 'Sparse_%' THEN 1 END), SUM(ID) FROM PERF_T" \
+  | tr '\t' '|')
+EXPECTED_SPARSE_SCALE="$PERF_ROWS|$expected_sparse_nulls|$expected_sparse_values|$expected_sparse_id_sum"
+if [[ "$SPARSE_SCALE_FINAL" != "$EXPECTED_SPARSE_SCALE" ]]; then
+    echo "Unexpected multi-vector sparse update state: expected $EXPECTED_SPARSE_SCALE got $SPARSE_SCALE_FINAL" >&2
+    exit 1
+fi
+log "PASS multi-vector sparse update rows=$PERF_ROWS batch_rows=$UPDATE_BATCH_ROWS changed_columns=2 final=$SPARSE_SCALE_FINAL seconds=$((sparse_scale_end - sparse_scale_start))"
+
 update_start=$(date +%s)
 mysql --table -e "USE $SCHEMA; UPDATE PERF_T SET NAME='Perf_updated' WHERE ID <= $PERF_UPDATE_ROWS; SELECT COUNT(*) AS U FROM PERF_T WHERE NAME='Perf_updated';" | tee -a "$REPORT"
 update_end=$(date +%s)

@@ -1304,20 +1304,23 @@ struct UpdateContext
     try
     {
       DbugReadSetGuard read_set_guard(table);
+      ensure_open(table);
+      if (update_fields.empty())
+        return 0;
       ensure_operation_open(table);
       if (pending_columns.empty())
       {
-        for (Field **field= table->field; *field; ++field)
+        for (Field *field: update_fields)
         {
           NativeColumnBuffer column;
-          column.variable= native_field_is_variable(*field);
+          column.variable= native_field_is_variable(field);
           pending_columns.push_back(std::move(column));
         }
       }
-      std::size_t column_index= 0;
-      for (Field **field= table->field; *field; ++field, ++column_index)
+      for (std::size_t column_index= 0; column_index < update_fields.size(); ++column_index)
       {
-        if (!append_field_to_column_buffer(pending_columns[column_index], *field))
+        if (!append_field_to_column_buffer(pending_columns[column_index],
+                                           update_fields[column_index]))
         {
           abort();
           return HA_ERR_UNSUPPORTED;
@@ -1372,7 +1375,15 @@ struct UpdateContext
       return;
     schema= table_schema_name(table);
     object= table_object_name(table);
-    columns= table_column_names(table);
+    if (!table->write_set)
+      throw std::runtime_error("EXASOL sparse update requires a MariaDB write set");
+    for (Field **field= table->field; *field; ++field)
+    {
+      if (!bitmap_is_set(table->write_set, (*field)->field_index))
+        continue;
+      columns.push_back(field_name(*field));
+      update_fields.push_back(*field);
+    }
     described= session->describe_table(schema, object);
     initialized= true;
   }
@@ -1424,11 +1435,10 @@ struct UpdateContext
     }
   }
 
-  void ensure_operation_open(TABLE *table)
+  void ensure_operation_open(TABLE *)
   {
     if (!connection)
       connection= &session->connection();
-    ensure_open(table);
     if (operation_open)
       return;
     const exasol_gw::SessionGwOpenOperationResult opened=
@@ -1485,6 +1495,7 @@ struct UpdateContext
   std::string schema;
   std::string object;
   std::vector<std::string> columns;
+  std::vector<Field *> update_fields;
   exasol_gw::SessionGwDescribeTableResult described;
   std::uint32_t max_rows_per_batch= 10000;
   std::uint32_t pending_rows= 0;
