@@ -11,47 +11,6 @@
 namespace exasol_gw
 {
 
-enum class SessionGwMessageType: std::uint16_t
-{
-  hello= 1,
-  hello_ok= 2,
-  ping= 3,
-  pong= 4,
-  close= 5,
-  ok= 6,
-  error= 7,
-  describe_table= 8,
-  describe_table_result= 9,
-  get_table_version= 10,
-  get_table_version_result= 11,
-  open_pushed_query= 12,
-  open_cursor_result= 13,
-  fetch= 14,
-  fetch_result= 15,
-  close_cursor= 16,
-  open_table_scan= 17,
-  open_table_insert= 18,
-  open_table_operation_result= 19,
-  insert_rows= 20,
-  affected_rows_result= 21,
-  close_operation= 22,
-  set_autocommit= 23,
-  commit= 24,
-  rollback= 25,
-  open_table_update= 26,
-  update_rows= 27,
-  open_table_delete= 28,
-  delete_rows= 29,
-  fetch_positioned_rows= 30
-};
-
-struct SessionGwFrame
-{
-  SessionGwMessageType type= SessionGwMessageType::hello;
-  std::uint64_t request_id= 0;
-  std::vector<std::uint8_t> payload;
-};
-
 enum class SessionGwErrorCategory: std::uint16_t
 {
   protocol_error= 1,
@@ -147,20 +106,6 @@ struct SessionGwOpenOperationResult
   std::uint64_t operation_id= 0;
   std::vector<std::uint8_t> accepted_schema;
 };
-
-void append_u8(std::vector<std::uint8_t> &out, std::uint8_t value);
-void append_u16(std::vector<std::uint8_t> &out, std::uint16_t value);
-void append_u32(std::vector<std::uint8_t> &out, std::uint32_t value);
-void append_u64(std::vector<std::uint8_t> &out, std::uint64_t value);
-void append_string16(std::vector<std::uint8_t> &out, const std::string &value);
-void append_string32(std::vector<std::uint8_t> &out, const std::string &value);
-void append_bytes32(std::vector<std::uint8_t> &out, const std::vector<std::uint8_t> &bytes);
-std::uint8_t read_u8(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
-std::uint16_t read_u16(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
-std::uint32_t read_u32(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
-std::uint64_t read_u64(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
-std::string read_string16(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
-std::vector<std::uint8_t> read_bytes32(const std::vector<std::uint8_t> &bytes, std::size_t &offset);
 
 SessionGwOptions options_from_environment();
 void execute_sql(const SessionGwOptions &options, const std::string &sql);

@@ -29,6 +29,7 @@ FAULT_TIMEOUT_SECONDS=${FAULT_TIMEOUT_SECONDS:-20}
 POSITIONED_DML_TEST_ONLY=${POSITIONED_DML_TEST_ONLY:-0}
 POSITIONED_DML_BATCH_ROWS=${POSITIONED_DML_BATCH_ROWS:-3}
 SESSIONGW_FETCH_ROWS=${EXASOL_SESSIONGW_FETCH_ROWS:-1024}
+SESSIONGATEWAY_SDK_RUNTIME_PATH=${SESSIONGATEWAY_SDK_RUNTIME_PATH:-}
 if (( PERF_UPDATE_ROWS == 0 )); then PERF_UPDATE_ROWS=1; fi
 if (( PERF_DELETE_ROWS == 0 )); then PERF_DELETE_ROWS=1; fi
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" && ! "$POSITIONED_DML_BATCH_ROWS" =~ ^[3-9][0-9]*$ ]]; then
@@ -76,9 +77,11 @@ cleanup() {
         kill "$(cat "$PIDFILE")" >/dev/null 2>&1 || true
     fi
     if [[ -f "$NANO_BASE/pid" ]]; then
-        kill "$(cat "$NANO_BASE/pid")" >/dev/null 2>&1 || true
+        nano_pid=$(cat "$NANO_BASE/pid")
+        # AppRun starts several descendants. It has its own process group so
+        # cleanup cannot kill the invoking shell by matching BASE_DIR text.
+        kill -- "-$nano_pid" >/dev/null 2>&1 || kill "$nano_pid" >/dev/null 2>&1 || true
     fi
-    pkill -f "$BASE_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -322,7 +325,7 @@ fi
 
 "$NANO_RUN" --target "$NANO_APP" --noexec >/dev/null
 APPDIR=$(find "$NANO_APP" -maxdepth 1 -type d -name '*.AppDir' | head -n 1)
-(cd "$NANO_BASE" && "$APPDIR/AppRun" --db-files-dir "$NANO_DB" --port "$EXASOL_PORT" \
+(cd "$NANO_BASE" && setsid "$APPDIR/AppRun" --db-files-dir "$NANO_DB" --port "$EXASOL_PORT" \
     -dbram="$NANO_DBRAM" >"$NANO_BASE/nano.log" 2>&1 & echo $! > "$NANO_BASE/pid")
 for _ in $(seq 1 90); do
     if sql_exasol 'select 1' >/dev/null 2>&1; then break; fi
@@ -344,6 +347,7 @@ EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
 EXASOL_SESSIONGW_FETCH_ROWS=$SESSIONGW_FETCH_ROWS \
 EXASOL_SESSIONGW_UPDATE_BATCH_ROWS=$UPDATE_BATCH_ROWS \
 EXASOL_SESSIONGW_DELETE_BATCH_ROWS=$DELETE_BATCH_ROWS \
+LD_LIBRARY_PATH="$SESSIONGATEWAY_SDK_RUNTIME_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 "$MARIADB_BUILD/sql/mariadbd" --no-defaults \
     --datadir="$MDB/data" --socket="$SOCKET" --pid-file="$PIDFILE" \
     --port=0 --skip-networking \
@@ -738,8 +742,15 @@ for pid in "${read_pids[@]}"; do
 done
 log "PASS concurrent reads clients=$READ_CLIENTS"
 
-# Concurrent insert statements either commit completely or propagate a MariaDB
-# deadlock error for Exasol transaction conflicts. The adapter must not replay.
+# Exercise transport/session concurrency without intentionally serializing all
+# writers on one DMP table lock. Transaction-conflict behavior on a shared table
+# is covered by the dedicated conflict workload; each client here owns a target.
+CONCURRENT_DDL="USE $SCHEMA;"
+for client in $(seq 0 $((INSERT_CLIENTS - 1))); do
+    CONCURRENT_DDL+=" CREATE TABLE CONCURRENT_INSERT_$client(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;"
+done
+mysql -e "$CONCURRENT_DDL"
+
 for round in $(seq 0 $((INSERT_ROUNDS - 1))); do
     insert_pids=()
     for client in $(seq 0 $((INSERT_CLIENTS - 1))); do
@@ -753,10 +764,9 @@ for round in $(seq 0 $((INSERT_ROUNDS - 1))); do
         done
         (
             if mysql --batch --raw --skip-column-names \
-                -e "USE $SCHEMA; INSERT INTO T VALUES $values;" 2>"$error_file"; then
+                -e "USE $SCHEMA; INSERT INTO CONCURRENT_INSERT_$client VALUES $values;" \
+                2>"$error_file"; then
                 echo "committed $first_id $last_id" >"$result_file"
-            elif grep -q "ERROR 1213" "$error_file"; then
-                echo "conflict $first_id $last_id" >"$result_file"
             else
                 cat "$error_file" >&2
                 exit 1
@@ -769,28 +779,38 @@ for round in $(seq 0 $((INSERT_ROUNDS - 1))); do
     done
 done
 
-EXPECTED_COUNT=3
-EXPECTED_SUM=7
-EXPECTED_NAMES=0
+EXPECTED_CONCURRENT_COUNT=0
+EXPECTED_CONCURRENT_SUM=0
 COMMITTED_WRITERS=0
-CONFLICTED_WRITERS=0
 for result_file in "$BASE_DIR"/insert_*.result; do
     read -r outcome first_id last_id <"$result_file"
-    if [[ "$outcome" == "committed" ]]; then
-        rows=$((last_id - first_id + 1))
-        EXPECTED_COUNT=$((EXPECTED_COUNT + rows))
-        EXPECTED_SUM=$((EXPECTED_SUM + (first_id + last_id) * rows / 2))
-        EXPECTED_NAMES=$((EXPECTED_NAMES + rows))
-        COMMITTED_WRITERS=$((COMMITTED_WRITERS + 1))
-    else
-        CONFLICTED_WRITERS=$((CONFLICTED_WRITERS + 1))
+    if [[ "$outcome" != "committed" ]]; then
+        echo "Unexpected concurrent writer outcome: $outcome" >&2
+        exit 1
     fi
+    rows=$((last_id - first_id + 1))
+    EXPECTED_CONCURRENT_COUNT=$((EXPECTED_CONCURRENT_COUNT + rows))
+    EXPECTED_CONCURRENT_SUM=$((EXPECTED_CONCURRENT_SUM + (first_id + last_id) * rows / 2))
+    COMMITTED_WRITERS=$((COMMITTED_WRITERS + 1))
 done
-log "PASS concurrent inserts clients=$INSERT_CLIENTS rounds=$INSERT_ROUNDS rows_per_client=$INSERT_ROWS_PER_CLIENT committed=$COMMITTED_WRITERS conflicts=$CONFLICTED_WRITERS"
+
+CONCURRENT_UNION=""
+for client in $(seq 0 $((INSERT_CLIENTS - 1))); do
+    CONCURRENT_UNION+="${CONCURRENT_UNION:+ UNION ALL }SELECT ID, NAME FROM CONCURRENT_INSERT_$client"
+done
+CONCURRENT_FINAL=$(mysql --batch --raw --skip-column-names -e \
+    "USE $SCHEMA; SELECT COUNT(*), SUM(ID), COUNT(CASE WHEN NAME LIKE 'Name_%' THEN 1 END) FROM ($CONCURRENT_UNION) AS WRITES;")
+EXPECTED_CONCURRENT="$EXPECTED_CONCURRENT_COUNT|$EXPECTED_CONCURRENT_SUM|$EXPECTED_CONCURRENT_COUNT"
+CONCURRENT_FINAL=$(echo "$CONCURRENT_FINAL" | tr '\t' '|')
+if [[ "$CONCURRENT_FINAL" != "$EXPECTED_CONCURRENT" ]]; then
+    echo "Unexpected concurrent target state: expected $EXPECTED_CONCURRENT got $CONCURRENT_FINAL" >&2
+    exit 1
+fi
+log "PASS concurrent inserts clients=$INSERT_CLIENTS rounds=$INSERT_ROUNDS rows_per_client=$INSERT_ROWS_PER_CLIENT committed=$COMMITTED_WRITERS distinct_targets=$INSERT_CLIENTS final=$CONCURRENT_FINAL"
 
 FINAL_ROWS=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM T; SELECT SUM(ID) FROM T; SELECT COUNT(*) FROM T WHERE NAME LIKE 'Name_%';")
 FINAL=$(echo "$FINAL_ROWS" | paste -sd'|' -)
-EXPECTED="$EXPECTED_COUNT|$EXPECTED_SUM|$EXPECTED_NAMES"
+EXPECTED="3|7|0"
 if [[ "$FINAL" != "$EXPECTED" ]]; then
     echo "Unexpected MariaDB final state: expected $EXPECTED got $FINAL" >&2
     exit 1
