@@ -56,7 +56,7 @@ public:
   void record_row_materialize(std::uint64_t nanoseconds);
   void record_native_encode(std::uint64_t nanoseconds);
   bool instrumentation_enabled() const noexcept;
-  void reset();
+  void reset() noexcept;
 
 private:
   void finish_idle_read_transaction();

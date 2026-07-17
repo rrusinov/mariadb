@@ -1,3 +1,7 @@
+#define MYSQL_SERVER 1
+#include <my_global.h>
+#include <my_dbug.h>
+
 #include "exasol_sessiongw_client.h"
 
 #include <openssl/bio.h>
@@ -941,6 +945,10 @@ private:
   {
     const auto started= options_.instrumentation_enabled ? std::chrono::steady_clock::now()
                                                           : std::chrono::steady_clock::time_point{};
+    const bool completion_may_be_durable= type == SessionGwMessageType::close_operation ||
+                                          type == SessionGwMessageType::commit;
+    const std::uint64_t sent_request_id= request_id_;
+    bool authoritative_response_received= false;
     if (options_.instrumentation_enabled)
     {
       ++statistics_.requests;
@@ -950,6 +958,18 @@ private:
     {
       send_frame(type, payload);
       SessionGwFrame frame= receive_frame();
+      DBUG_EXECUTE_IF("exasol_gw_completion_ack_lost",
+        if (completion_may_be_durable)
+          throw SessionGwError(SessionGwErrorCategory::transport_error,
+                               "injected transport loss after SessionGW completion"););
+      if (frame.request_id != sent_request_id)
+      {
+        std::ostringstream out;
+        out << "unexpected SessionGW response request id " << frame.request_id
+            << ", expected " << sent_request_id;
+        throw SessionGwError(SessionGwErrorCategory::protocol_error, out.str());
+      }
+      authoritative_response_received= true;
       if (options_.instrumentation_enabled)
       {
         statistics_.response_bytes += frame_header_size + frame.payload.size();
@@ -972,6 +992,18 @@ private:
       if (options_.instrumentation_enabled &&
           error.category() == SessionGwErrorCategory::transaction_conflict)
         ++statistics_.transaction_conflicts;
+      if (completion_may_be_durable && !authoritative_response_received &&
+          error.category() == SessionGwErrorCategory::transport_error)
+      {
+        // Do not send any further SessionGateway request on a connection with
+        // an uncertain completion. Tear down the carrier before reporting it.
+        session_gateway_entered_= false;
+        close();
+        std::ostringstream out;
+        out << "SessionGW outcome unknown after completion request "
+            << sent_request_id << "; the operation must not be replayed";
+        throw SessionGwError(SessionGwErrorCategory::outcome_unknown, out.str());
+      }
       throw;
     }
   }

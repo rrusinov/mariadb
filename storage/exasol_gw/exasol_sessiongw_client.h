@@ -65,7 +65,10 @@ enum class SessionGwErrorCategory: std::uint16_t
   resource_limit= 9,
   cursor_not_found= 10,
   internal_error= 11,
-  transport_error= 12
+  transport_error= 12,
+  // Client-local category: the completion request may have been applied, but
+  // no authoritative response was received. This is not a server wire value.
+  outcome_unknown= 13
 };
 
 class SessionGwError: public std::runtime_error

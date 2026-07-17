@@ -52,8 +52,16 @@ int report_sessiongw_error(const exasol_gw::SessionGwError &error) noexcept
 {
   if (error.category() == exasol_gw::SessionGwErrorCategory::transaction_conflict)
     return HA_ERR_LOCK_DEADLOCK;
-  if (!current_thd->get_stmt_da()->is_set())
+  Diagnostics_area *diagnostics= current_thd->get_stmt_da();
+  if (!diagnostics->is_error())
+  {
+    const bool overwrite_status= diagnostics->is_set();
+    if (overwrite_status)
+      diagnostics->set_overwrite_status(true);
     my_error(ER_GET_ERRNO, MYF(0), HA_ERR_INTERNAL_ERROR, error.what());
+    if (overwrite_status)
+      diagnostics->set_overwrite_status(false);
+  }
   return HA_ERR_INTERNAL_ERROR;
 }
 
@@ -268,6 +276,7 @@ public:
   int write_row(const uchar *) override;
   int update_row(const uchar *, const uchar *) override;
   int delete_row(const uchar *) override;
+  void print_error(int error, myf error_flags) override;
 
   int rnd_init(bool) override
   {
@@ -1731,11 +1740,22 @@ void ha_exasol_gw::start_bulk_insert(ha_rows, uint)
   }
 }
 
+void ha_exasol_gw::print_error(int error, myf error_flags)
+{
+  // Some DML errors are discovered while MariaDB releases the external table
+  // lock. Preserve the precise diagnostic already installed by SessionGW
+  // instead of asking handler::print_error() to install a second one.
+  THD *thd= table ? table->in_use : nullptr;
+  if (thd && thd->get_stmt_da()->is_error())
+    return;
+  handler::print_error(error, error_flags);
+}
+
 int ha_exasol_gw::end_bulk_insert()
 {
   try
   {
-    if (table->in_use->is_error())
+    if (table->in_use->is_error() || table->in_use->get_stmt_da()->is_error())
     {
       abort_dml_contexts();
       return 0;
@@ -1758,7 +1778,7 @@ int ha_exasol_gw::external_lock(THD *thd, int lock_type)
       return 0;
     }
 
-    if (thd->is_error())
+    if (thd->is_error() || thd->get_stmt_da()->is_error())
     {
       abort_dml_contexts();
       // Do not replace MariaDB's original statement error with cleanup status.
@@ -1771,6 +1791,13 @@ int ha_exasol_gw::external_lock(THD *thd, int lock_type)
   }
   catch (...)
   {
+    if (thd->is_error() || thd->get_stmt_da()->is_error())
+    {
+      abort_dml_contexts();
+      // Unlock cleanup must not raise a second handler error over the statement
+      // diagnostic (notably after an unknown CloseOperation outcome).
+      return 0;
+    }
     return report_handler_exception("changing EXASOL statement lock state");
   }
 }

@@ -223,15 +223,23 @@ void SessionGwThdContext::finish_idle_read_transaction()
   }
 }
 
-void SessionGwThdContext::reset()
+void SessionGwThdContext::reset() noexcept
 {
-  connection_.close();
+  // Invalidate local ownership before best-effort transport cleanup. A broken
+  // connection must not leave this THD looking connected or trigger replay.
   connected_= false;
   open_cursors_= 0;
   open_operations_= 0;
   statement_tables_= 0;
   read_transaction_pending_= false;
   metadata_cache_.clear();
+  try
+  {
+    connection_.close();
+  }
+  catch (...)
+  {
+  }
 }
 
 SessionGwThdContext &session_for_thd(THD *thd)

@@ -428,6 +428,24 @@ if mysql -e "SET SESSION debug_dbug=''" >/dev/null 2>&1; then
         "USE $SCHEMA; SELECT COUNT(*) FROM DML_ABORT_GUARD" "2"
     log "PASS failed insert/update/delete CLEAN-abort completed prefixes and preserve original errors"
 
+    mysql -e "USE $SCHEMA; CREATE TABLE OUTCOME_UNKNOWN_GUARD(ID INT, NAME VARCHAR(20)) ENGINE=EXASOL; INSERT INTO OUTCOME_UNKNOWN_GUARD VALUES (1, 'one'), (2, 'two')"
+    expect_failure_contains "lost insert completion acknowledgement reports unknown outcome" \
+        "SET SESSION debug_dbug='+d,exasol_gw_completion_ack_lost'; USE $SCHEMA; INSERT INTO OUTCOME_UNKNOWN_GUARD VALUES (3, 'three')" \
+        "outcome unknown"
+    expect_scalar "unknown insert outcome was applied exactly once without replay" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM OUTCOME_UNKNOWN_GUARD WHERE ID=3 AND NAME='three'" "1"
+    expect_failure_contains "lost update completion acknowledgement reports unknown outcome" \
+        "SET SESSION debug_dbug='+d,exasol_gw_completion_ack_lost'; USE $SCHEMA; UPDATE OUTCOME_UNKNOWN_GUARD SET NAME='updated' WHERE ID=1" \
+        "outcome unknown"
+    expect_scalar "unknown update outcome was applied exactly once without replay" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM OUTCOME_UNKNOWN_GUARD WHERE ID=1 AND NAME='updated'" "1"
+    expect_failure_contains "lost delete completion acknowledgement reports unknown outcome" \
+        "SET SESSION debug_dbug='+d,exasol_gw_completion_ack_lost'; USE $SCHEMA; DELETE FROM OUTCOME_UNKNOWN_GUARD WHERE ID=2" \
+        "outcome unknown"
+    expect_scalar "unknown delete outcome was applied exactly once without replay" \
+        "USE $SCHEMA; SELECT COUNT(*) FROM OUTCOME_UNKNOWN_GUARD WHERE ID=2" "0"
+    log "PASS lost completion acknowledgements report UNKNOWN without replaying durable DML"
+
     mysql -e "USE $SCHEMA; CREATE TABLE SHARE_LOCK_GUARD(ID INT) ENGINE=EXASOL; FLUSH TABLE SHARE_LOCK_GUARD"
     expect_timed_failure_contains "table share construction allocation fault" \
         "SET SESSION debug_dbug='+d,exasol_gw_share_constructor_oom'; USE $SCHEMA; SELECT COUNT(*) FROM SHARE_LOCK_GUARD" \
