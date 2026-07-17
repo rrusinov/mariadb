@@ -323,10 +323,26 @@ std::string int64_to_string(std::int64_t value)
   return buffer;
 }
 
-std::string uint128_decimal_to_string(const std::uint8_t *bytes)
+std::string decimal128_to_string(const std::uint8_t *bytes)
 {
-  // Enough for smoke tests: handle values that fit in signed 64-bit.
-  return int64_to_string(le64s(bytes));
+  unsigned __int128 encoded= 0;
+  for (std::size_t index= 0; index < 16U; ++index)
+    encoded |= static_cast<unsigned __int128>(bytes[index]) << (index * 8U);
+  const bool negative= (bytes[15] & 0x80U) != 0;
+  unsigned __int128 magnitude= negative ? (~encoded + 1U) : encoded;
+
+  std::string digits;
+  do
+  {
+    digits.push_back(static_cast<char>('0' + magnitude % 10U));
+    magnitude /= 10U;
+  }
+  while (magnitude != 0);
+  std::reverse(digits.begin(), digits.end());
+
+  if (negative)
+    digits.insert(0, 1, '-');
+  return digits;
 }
 
 std::string date32_to_string(std::int32_t days)
@@ -349,8 +365,13 @@ std::string date32_to_string(std::int32_t days)
 
 std::string timestamp_ns_to_string(std::int64_t ns)
 {
-  const std::int64_t seconds= ns / 1000000000LL;
-  const std::int64_t nanos= ns % 1000000000LL;
+  std::int64_t seconds= ns / 1000000000LL;
+  std::int64_t nanos= ns % 1000000000LL;
+  if (nanos < 0)
+  {
+    --seconds;
+    nanos += 1000000000LL;
+  }
   std::time_t t= static_cast<std::time_t>(seconds);
   std::tm tm{};
   gmtime_r(&t, &tm);
@@ -434,7 +455,7 @@ ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_mes
             values_ref.length % 16 == 0)
         {
           // Exasol SQL numeric/integer expressions commonly arrive as Arrow Decimal128.
-          cell.value= uint128_decimal_to_string(values + row * 16U);
+          cell.value= decimal128_to_string(values + row * 16U);
         }
         else
         {
@@ -470,7 +491,7 @@ ArrowRowBatch decode_arrow_record_batch(const std::vector<std::uint8_t> &ipc_mes
         break;
       case ArrowColumnKind::decimal128_as_integer_string:
         require(values_ref.length >= static_cast<std::int64_t>((row + 1U) * 16U), "Arrow decimal128 buffer too small");
-        cell.value= uint128_decimal_to_string(values + row * 16U);
+        cell.value= decimal128_to_string(values + row * 16U);
         break;
       case ArrowColumnKind::utf8:
         break;

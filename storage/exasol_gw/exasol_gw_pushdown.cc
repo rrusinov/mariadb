@@ -6,6 +6,7 @@
 #include "field.h"
 #include "table.h"
 #include "sql_class.h"
+#include "tztime.h"
 #include "sql_lex.h"
 
 #include "exasol_gw_pushdown.h"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -102,10 +104,45 @@ std::string apply_decimal_scale(const std::string &integer_value, uint scale)
   return negative ? "-" + digits : digits;
 }
 
+std::string utc_timestamp_for_session(Field *field, const std::string &value)
+{
+  MYSQL_TIME utc{};
+  if (std::sscanf(value.c_str(), "%u-%u-%u %u:%u:%u.%lu",
+                  &utc.year, &utc.month, &utc.day, &utc.hour, &utc.minute,
+                  &utc.second, &utc.second_part) != 7)
+    throw std::runtime_error("invalid UTC timestamp returned by SessionGW");
+  utc.time_type= MYSQL_TIMESTAMP_DATETIME;
+
+  THD *thd= field->table ? field->table->in_use : nullptr;
+  if (!thd || !thd->variables.time_zone)
+    throw std::runtime_error("MariaDB session timezone is unavailable for TIMESTAMP conversion");
+  const longlong unix_days=
+      static_cast<longlong>(calc_daynr(utc.year, utc.month, utc.day)) -
+      static_cast<longlong>(calc_daynr(1970, 1, 1));
+  const __int128 utc_seconds_wide=
+      static_cast<__int128>(unix_days) * 86400 + utc.hour * 3600U +
+      utc.minute * 60U + utc.second;
+  if (utc_seconds_wide < std::numeric_limits<my_time_t>::min() ||
+      utc_seconds_wide > std::numeric_limits<my_time_t>::max())
+    throw std::runtime_error("SessionGW UTC timestamp is outside MariaDB TIMESTAMP range");
+  const my_time_t utc_seconds= static_cast<my_time_t>(utc_seconds_wide);
+  MYSQL_TIME local{};
+  thd->variables.time_zone->gmt_sec_to_TIME(&local, utc_seconds);
+
+  char formatted[64];
+  std::snprintf(formatted, sizeof(formatted), "%04u-%02u-%02u %02u:%02u:%02u.%06lu",
+                local.year, local.month, local.day, local.hour, local.minute,
+                local.second, utc.second_part);
+  return formatted;
+}
+
 std::string cell_value_for_field(Field *field, const exasol_gw::ArrowCell &cell)
 {
   if (field->type() == MYSQL_TYPE_DECIMAL || field->type() == MYSQL_TYPE_NEWDECIMAL)
     return apply_decimal_scale(cell.value, field->decimals());
+  if (field->real_type() == MYSQL_TYPE_TIMESTAMP ||
+      field->real_type() == MYSQL_TYPE_TIMESTAMP2)
+    return utc_timestamp_for_session(field, cell.value);
   return cell.value;
 }
 
@@ -377,8 +414,15 @@ int ha_exasol_gw_cursor::materialize_row(
       else
       {
         field->set_notnull();
-        const std::string value= cell_value_for_field(field, cell);
-        field->store(value.data(), value.size(), &my_charset_bin);
+        if (field->real_type() == MYSQL_TYPE_BIT)
+        {
+          field->store(cell.value == "1" ? 1LL : 0LL, true);
+        }
+        else
+        {
+          const std::string value= cell_value_for_field(field, cell);
+          field->store(value.data(), value.size(), &my_charset_bin);
+        }
       }
     }
     if (row < row_handles.size())

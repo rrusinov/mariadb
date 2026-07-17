@@ -9,6 +9,7 @@
 #include "sql_class.h"
 #include "sql_lex.h"
 #include "sql_select.h"
+#include "tztime.h"
 
 #include "exasol_arrow_ipc.h"
 #include "exasol_gw_pushdown.h"
@@ -603,9 +604,12 @@ bool append_exasol_type(Field *field, Create_field *create_field,
     return true;
   case MYSQL_TYPE_DATETIME:
   case MYSQL_TYPE_DATETIME2:
+    *sql += "TIMESTAMP(" + std::to_string(field->decimals()) + ")";
+    return true;
   case MYSQL_TYPE_TIMESTAMP:
   case MYSQL_TYPE_TIMESTAMP2:
-    *sql += "TIMESTAMP(" + std::to_string(field->decimals()) + ")";
+    *sql += "TIMESTAMP(" + std::to_string(field->decimals()) +
+            ") WITH LOCAL TIME ZONE";
     return true;
   case MYSQL_TYPE_BIT:
     if (field->field_length == 1)
@@ -769,9 +773,12 @@ LocalColumnDescription local_column_description(Field *field)
     break;
   case MYSQL_TYPE_DATETIME:
   case MYSQL_TYPE_DATETIME2:
+    result.type_id= "DTM_timestamp";
+    result.precision= static_cast<std::int32_t>(field->decimals());
+    break;
   case MYSQL_TYPE_TIMESTAMP:
   case MYSQL_TYPE_TIMESTAMP2:
-    result.type_id= "DTM_timestamp";
+    result.type_id= "DTM_timestampUtc";
     result.precision= static_cast<std::int32_t>(field->decimals());
     break;
   case MYSQL_TYPE_BIT:
@@ -843,12 +850,43 @@ MYSQL_TIME native_temporal_value(Field *field)
 std::uint32_t parse_native_date(Field *field)
 {
   const MYSQL_TIME value= native_temporal_value(field);
+  if (value.year == 0 || value.month == 0 || value.day == 0)
+    throw std::runtime_error("zero MariaDB dates are not representable by EXASOL");
   return native_date_value(value.year, value.month, value.day);
 }
 
 ExasolNativeTimestamp parse_native_timestamp(Field *field)
 {
-  const MYSQL_TIME value= native_temporal_value(field);
+  MYSQL_TIME value= native_temporal_value(field);
+  if (value.year == 0 || value.month == 0 || value.day == 0)
+    throw std::runtime_error("zero MariaDB timestamps are not representable by EXASOL");
+
+  const enum_field_types type= field->real_type();
+  if (type == MYSQL_TYPE_TIMESTAMP || type == MYSQL_TYPE_TIMESTAMP2)
+  {
+    THD *thd= field->table ? field->table->in_use : nullptr;
+    if (!thd || !thd->variables.time_zone)
+      throw std::runtime_error("MariaDB session timezone is unavailable for TIMESTAMP conversion");
+    uint conversion_error= 0;
+    const my_time_t utc_seconds=
+        thd->variables.time_zone->TIME_to_gmt_sec(&value, &conversion_error);
+    if (conversion_error != 0)
+      throw std::runtime_error("MariaDB TIMESTAMP is ambiguous or invalid in the session timezone");
+    const unsigned long microseconds= value.second_part;
+    my_tz_UTC->gmt_sec_to_TIME(&value, utc_seconds);
+    value.second_part= microseconds;
+  }
+
+  const longlong unix_days= static_cast<longlong>(calc_daynr(value.year, value.month, value.day)) -
+                            static_cast<longlong>(calc_daynr(1970, 1, 1));
+  const __int128_t unix_nanoseconds=
+      (static_cast<__int128_t>(unix_days) * 86400 + value.hour * 3600U +
+       value.minute * 60U + value.second) * 1000000000 +
+      static_cast<__int128_t>(value.second_part) * 1000;
+  if (unix_nanoseconds < std::numeric_limits<std::int64_t>::min() ||
+      unix_nanoseconds > std::numeric_limits<std::int64_t>::max())
+    throw std::runtime_error("MariaDB timestamp is outside the SessionGW timestamp(ns) range");
+
   return {static_cast<std::uint32_t>(value.second_part) * 1000U,
           value.hour * 3600U + value.minute * 60U + value.second,
           native_date_value(value.year, value.month, value.day), 0U};
@@ -948,9 +986,14 @@ bool append_field_to_column_buffer(NativeColumnBuffer &column, Field *field)
   {
   case MYSQL_TYPE_TINY:
   case MYSQL_TYPE_SHORT:
-  case MYSQL_TYPE_LONG:
   case MYSQL_TYPE_INT24:
   case MYSQL_TYPE_YEAR:
+  {
+    const std::int32_t value= field->is_null() ? 0 : static_cast<std::int32_t>(field->val_int());
+    append_fixed_value(column.fixed, &value, sizeof(value));
+    return true;
+  }
+  case MYSQL_TYPE_LONG:
   {
     const std::int64_t value= field->is_null() ? 0 : static_cast<std::int64_t>(field->val_int());
     append_fixed_value(column.fixed, &value, sizeof(value));
@@ -973,7 +1016,17 @@ bool append_field_to_column_buffer(NativeColumnBuffer &column, Field *field)
   case MYSQL_TYPE_NEWDECIMAL:
   {
     const __int128_t scaled= field->is_null() ? 0 : parse_scaled_decimal(field);
-    if (field->field_length <= 18)
+    const uint precision= field->real_type() == MYSQL_TYPE_NEWDECIMAL
+                             ? static_cast<Field_new_decimal *>(field)->precision
+                             : my_decimal_length_to_precision(field->field_length,
+                                                              field->decimals(),
+                                                              field->is_unsigned());
+    if (precision <= 9)
+    {
+      const std::int32_t value= static_cast<std::int32_t>(scaled);
+      append_fixed_value(column.fixed, &value, sizeof(value));
+    }
+    else if (precision <= 18)
     {
       const std::int64_t value= static_cast<std::int64_t>(scaled);
       append_fixed_value(column.fixed, &value, sizeof(value));
@@ -1026,6 +1079,21 @@ bool append_field_to_column_buffer(NativeColumnBuffer &column, Field *field)
     return true;
   }
   }
+}
+
+std::size_t estimated_native_batch_bytes(const std::vector<NativeColumnBuffer> &columns)
+{
+  // SGW1 frames are capped at 1 MiB. Keep ample room for batch framing,
+  // operation metadata, and worst-case 16-byte alignment padding.
+  std::size_t bytes= 64U;
+  for (const NativeColumnBuffer &column: columns)
+  {
+    bytes += 32U + column.nulls.size();
+    bytes += column.variable
+                 ? column.sizes.size() * sizeof(std::uint64_t) + column.variable_data.size()
+                 : column.fixed.size();
+  }
+  return bytes;
 }
 
 bool build_native_batch_from_columns(const std::vector<NativeColumnBuffer> &columns,
@@ -1132,7 +1200,8 @@ struct InsertContext
         }
       }
       ++pending_rows;
-      if (pending_rows >= max_rows_per_batch)
+      if (pending_rows >= max_rows_per_batch ||
+          estimated_native_batch_bytes(pending_columns) >= 512U * 1024U)
         return flush(table);
       return 0;
     }
@@ -1329,7 +1398,8 @@ struct UpdateContext
       }
       pending_handles.push_back(row_handle);
       ++pending_rows;
-      if (pending_rows >= max_rows_per_batch)
+      if (pending_rows >= max_rows_per_batch ||
+          estimated_native_batch_bytes(pending_columns) >= 512U * 1024U)
         return flush(table);
       return 0;
     }

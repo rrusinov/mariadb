@@ -37,6 +37,7 @@ if [[ "$POSITIONED_DML_TEST_ONLY" == "1" && ! "$POSITIONED_DML_BATCH_ROWS" =~ ^[
     exit 2
 fi
 
+INSERT_BATCH_ROWS=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}
 UPDATE_BATCH_ROWS=${EXASOL_SESSIONGW_UPDATE_BATCH_ROWS:-10000}
 DELETE_BATCH_ROWS=${EXASOL_SESSIONGW_DELETE_BATCH_ROWS:-10000}
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
@@ -315,7 +316,7 @@ log "perf_update_rows=$PERF_UPDATE_ROWS"
 log "perf_delete_rows=$PERF_DELETE_ROWS"
 log "insert_rounds=$INSERT_ROUNDS"
 log "insert_rows_per_client=$INSERT_ROWS_PER_CLIENT"
-log "sessiongw_insert_batch_rows=${EXASOL_SESSIONGW_INSERT_BATCH_ROWS:-10000}"
+log "sessiongw_insert_batch_rows=$INSERT_BATCH_ROWS"
 log "sessiongw_update_batch_rows=$UPDATE_BATCH_ROWS"
 log "sessiongw_delete_batch_rows=$DELETE_BATCH_ROWS"
 log "sessiongw_fetch_rows=$SESSIONGW_FETCH_ROWS"
@@ -345,6 +346,7 @@ EXASOL_SESSIONGW_PASSWORD=exasol \
 EXASOL_SESSIONGW_TLS=skip_verify \
 EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
 EXASOL_SESSIONGW_FETCH_ROWS=$SESSIONGW_FETCH_ROWS \
+EXASOL_SESSIONGW_INSERT_BATCH_ROWS=$INSERT_BATCH_ROWS \
 EXASOL_SESSIONGW_UPDATE_BATCH_ROWS=$UPDATE_BATCH_ROWS \
 EXASOL_SESSIONGW_DELETE_BATCH_ROWS=$DELETE_BATCH_ROWS \
 LD_LIBRARY_PATH="$SESSIONGATEWAY_SDK_RUNTIME_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -671,6 +673,11 @@ CREATE TABLE TYPE_UPD(ID INT, D DECIMAL(12,2), DT DATE, TS TIMESTAMP(6) NULL, V 
 INSERT INTO TYPE_UPD VALUES (1, 1.25, '2026-07-10', '2026-07-10 11:12:13.123456', 'before');
 UPDATE TYPE_UPD SET D=42.42, DT='2026-07-11', TS='2026-07-11 01:02:03.654321', V='updated' WHERE ID=1;
 SELECT ID, D, DT, TS, V FROM TYPE_UPD ORDER BY ID;
+CREATE TABLE TYPE_EDGE(ID INT, BI BIGINT, D DECIMAL(36,18), DT DATETIME(6)) ENGINE=EXASOL;
+INSERT INTO TYPE_EDGE VALUES
+  (1, -9223372036854775808, -999999999999999999.999999999999999999, '1900-01-01 00:00:00.000001'),
+  (2,  9223372036854775807,  999999999999999999.999999999999999999, '2038-01-19 03:14:07.999999');
+SELECT ID, BI, D, DT FROM TYPE_EDGE ORDER BY ID;
 SQL
 expect_scalar "type matrix final count" "USE $SCHEMA; SELECT COUNT(*) FROM TYPES" "1"
 TYPE_UPD_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT ID FROM TYPE_UPD; SELECT D FROM TYPE_UPD; SELECT DT FROM TYPE_UPD; SELECT TS FROM TYPE_UPD; SELECT V FROM TYPE_UPD;" | paste -sd'|' -)
@@ -679,6 +686,30 @@ if [[ "$TYPE_UPD_FINAL" != "1|42.42|2026-07-11|2026-07-11 01:02:03.654321|update
     exit 1
 fi
 log "PASS type update final $TYPE_UPD_FINAL"
+mysql -e "SET time_zone='+02:00'; USE $SCHEMA;
+  CREATE TABLE TYPE_TZ(ID INT, TS TIMESTAMP(6)) ENGINE=EXASOL;
+  INSERT INTO TYPE_TZ VALUES (1, '2026-07-10 11:12:13.123456');"
+TYPE_TZ_FINAL=$(mysql --batch --raw --skip-column-names -e \
+  "SET time_zone='-03:00'; USE $SCHEMA; SELECT TS FROM TYPE_TZ WHERE ID=1")
+if [[ "$TYPE_TZ_FINAL" != "2026-07-10 06:12:13.123456" ]]; then
+    echo "Unexpected cross-session timezone result: $TYPE_TZ_FINAL" >&2
+    exit 1
+fi
+TYPE_TZ_REMOTE=$(sql_exasol "select column_type from exa_all_columns where column_schema='$SCHEMA' and column_table='TYPE_TZ' and column_name='TS'")
+echo "$TYPE_TZ_REMOTE" | tee -a "$REPORT" | grep -q 'TIMESTAMP(6) WITH LOCAL TIME ZONE'
+log "PASS TIMESTAMP cross-session timezone conversion $TYPE_TZ_FINAL"
+TYPE_EDGE_FINAL=$(mysql --batch --raw --skip-column-names -e \
+  "USE $SCHEMA; SELECT ID, BI, D, DT FROM TYPE_EDGE ORDER BY ID" | tr '\t' '|' | paste -sd';' -)
+if [[ "$TYPE_EDGE_FINAL" != "1|-9223372036854775808|-999999999999999999.999999999999999999|1900-01-01 00:00:00.000001;2|9223372036854775807|999999999999999999.999999999999999999|2038-01-19 03:14:07.999999" ]]; then
+    echo "Unexpected type edge final state: $TYPE_EDGE_FINAL" >&2
+    exit 1
+fi
+log "PASS decimal, BIGINT, and timestamp edge round-trip $TYPE_EDGE_FINAL"
+expect_failure "timestamp outside Arrow ns range" \
+    "USE $SCHEMA; INSERT INTO TYPE_EDGE VALUES (3, 0, 0, '1000-01-01 00:00:00')"
+expect_failure "zero date rejected before mutation" \
+    "SET sql_mode='ALLOW_INVALID_DATES'; USE $SCHEMA; INSERT INTO TYPE_EDGE VALUES (4, 0, 0, '0000-00-00 00:00:00')"
+expect_scalar "rejected temporal rows did not mutate" "USE $SCHEMA; SELECT COUNT(*) FROM TYPE_EDGE" "2"
 log "PASS supported type matrix"
 
 mysql -e "USE $SCHEMA;
@@ -728,6 +759,97 @@ perf_start=$(date +%s)
 insert_start=$(date +%s)
 mysql --table < "$PERF_SQL" | tee -a "$REPORT"
 insert_end=$(date +%s)
+
+# Wide 100k+ profile for every MariaDB type accepted by ENGINE=EXASOL. INSERT
+# and UPDATE traverse native multi-vector writes; SELECT * forces Arrow decoding
+# and MariaDB field materialization for every value rather than pushdown-only
+# aggregate validation.
+TYPE_PERF_FILE=$BASE_DIR/perf_types.tsv
+TYPE_BOOL_SQL=$BASE_DIR/perf_bool.sql
+python3 - "$PERF_ROWS" "$TYPE_PERF_FILE" "$TYPE_BOOL_SQL" "$PERF_INSERT_BATCH_ROWS" "$SCHEMA" <<'PY_TYPES'
+import datetime
+import sys
+rows = int(sys.argv[1])
+path = sys.argv[2]
+bool_path = sys.argv[3]
+batch_rows = int(sys.argv[4])
+schema = sys.argv[5]
+with open(path, "w", encoding="utf-8") as out:
+    for row_id in range(1, rows + 1):
+        dt = datetime.date(2000, 1, 1) + datetime.timedelta(days=row_id % 7000)
+        dts = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=row_id, microseconds=row_id % 1000000)
+        ts = datetime.datetime(2020, 1, 1) + datetime.timedelta(seconds=row_id, microseconds=row_id % 1000000)
+        values = [
+            row_id,
+            row_id % 255 - 127, row_id % 256,
+            row_id % 65535 - 32767, row_id % 65536,
+            row_id % 16777215 - 8388607, row_id % 16777216,
+            row_id - 50000, row_id,
+            row_id - 50000, 2000 + row_id % 26,
+            f"{row_id / 100.0:.2f}", f"{row_id / 1000.0:.3f}",
+            f"{row_id / 10000.0:.4f}",
+            f"{row_id}.{row_id % 1000000:06d}", dt.isoformat(),
+            dts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            f"C{row_id % 100000000000:011d}", f"typed_{row_id}_ä",
+        ]
+        out.write("\t".join(map(str, values)) + "\n")
+with open(bool_path, "w", encoding="utf-8") as out:
+    out.write(f"USE {schema}; CREATE TABLE PERF_BOOL(ID INT, B BIT(1)) ENGINE=EXASOL;\n")
+    for first in range(1, rows + 1, batch_rows):
+        last = min(rows, first + batch_rows - 1)
+        values = ",".join(f"({row_id},b'{row_id % 2}')" for row_id in range(first, last + 1))
+        out.write(f"INSERT INTO PERF_BOOL VALUES {values};\n")
+PY_TYPES
+
+type_perf_insert_start=$(date +%s%3N)
+mysql -e "USE $SCHEMA;
+  CREATE TABLE PERF_TYPES(
+    ID INT, TI TINYINT, UTI TINYINT UNSIGNED,
+    SI SMALLINT, USI SMALLINT UNSIGNED,
+    MI MEDIUMINT, UMI MEDIUMINT UNSIGNED,
+    I INT, UI INT UNSIGNED, BI BIGINT, Y YEAR,
+    F FLOAT, DBL DOUBLE, D18 DECIMAL(18,4), D36 DECIMAL(36,18),
+    DT DATE, DTS DATETIME(6), TS TIMESTAMP(6),
+    C CHAR(12), V VARCHAR(80)
+  ) ENGINE=EXASOL;
+  LOAD DATA LOCAL INFILE '$TYPE_PERF_FILE' INTO TABLE PERF_TYPES
+    (ID,TI,UTI,SI,USI,MI,UMI,I,UI,BI,Y,F,DBL,D18,D36,DT,DTS,TS,C,V);"
+mysql < "$TYPE_BOOL_SQL"
+type_perf_insert_end=$(date +%s%3N)
+
+type_perf_read_start=$(date +%s%3N)
+mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT * FROM PERF_TYPES ORDER BY ID; SELECT * FROM PERF_BOOL ORDER BY ID" >/dev/null
+type_perf_read_end=$(date +%s%3N)
+
+type_perf_update_start=$(date +%s%3N)
+mysql -e "USE $SCHEMA;
+  UPDATE PERF_TYPES SET
+    TI=TI, UTI=UTI, SI=SI, USI=USI, MI=MI, UMI=UMI,
+    I=I, UI=UI, BI=BI, Y=Y, F=F, DBL=DBL,
+    D18=CASE WHEN MOD(ID,10)=0 THEN ID/10000.0 ELSE D18 END,
+    D36=-D36, DT=DT,
+    DTS=TIMESTAMPADD(MICROSECOND,1,DTS),
+    TS=CASE WHEN MOD(ID,10)=0 THEN '2020-01-01 00:00:00.123456' ELSE TS END,
+    C=C, V=CASE WHEN MOD(ID,10)=0 THEN CONCAT('updated_',ID) ELSE V END;
+  UPDATE PERF_BOOL SET B=B;"
+type_perf_update_end=$(date +%s%3N)
+
+type_perf_delete_start=$(date +%s%3N)
+mysql -e "USE $SCHEMA;
+  DELETE FROM PERF_TYPES WHERE ID > $((PERF_ROWS - PERF_DELETE_ROWS));
+  DELETE FROM PERF_BOOL WHERE ID > $((PERF_ROWS - PERF_DELETE_ROWS));"
+type_perf_delete_end=$(date +%s%3N)
+TYPE_PERF_FINAL=$(mysql --batch --raw --skip-column-names -e \
+  "USE $SCHEMA; SELECT COUNT(*), SUM(ID), COUNT(D18), COUNT(TS), COUNT(V), (SELECT COUNT(B) FROM PERF_BOOL) FROM PERF_TYPES" | tr '\t' '|')
+type_perf_count=$((PERF_ROWS - PERF_DELETE_ROWS))
+type_perf_sum=$((type_perf_count * (type_perf_count + 1) / 2))
+EXPECTED_TYPE_PERF="$type_perf_count|$type_perf_sum|$type_perf_count|$type_perf_count|$type_perf_count|$type_perf_count"
+if [[ "$TYPE_PERF_FINAL" != "$EXPECTED_TYPE_PERF" ]]; then
+    echo "Unexpected typed performance final state: expected $EXPECTED_TYPE_PERF got $TYPE_PERF_FINAL" >&2
+    exit 1
+fi
+log "PASS supported-type performance rows=$PERF_ROWS columns=21 insert_ms=$((type_perf_insert_end-type_perf_insert_start)) read_ms=$((type_perf_read_end-type_perf_read_start)) update_ms=$((type_perf_update_end-type_perf_update_start)) delete_ms=$((type_perf_delete_end-type_perf_delete_start)) final=$TYPE_PERF_FINAL"
 
 # One statement, one update operation, and repeated native vectors over 100k+
 # rows. Two sparse columns change, NULL/non-NULL values share batches, and the
