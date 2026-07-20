@@ -59,9 +59,10 @@ SessionGwThdContext::~SessionGwThdContext()
       " cursors_closed=%" PRIu64 " operations=%" PRIu64 " fetch_batches=%" PRIu64
       " fetched_rows=%" PRIu64 " positioned_cache_hits=%" PRIu64
       " positioned_fetches=%" PRIu64 " positioned_rows=%" PRIu64 " arrow_bytes=%" PRIu64
-      " projected_columns=%" PRIu64 " available_columns=%" PRIu64
+      " native_read_bytes=%" PRIu64 " projected_columns=%" PRIu64 " available_columns=%" PRIu64
       " arrow_decode_ns=%" PRIu64 " row_materialize_ns=%" PRIu64
-      " native_encode_ns=%" PRIu64 " insert_batches=%" PRIu64 " insert_rows=%" PRIu64
+      " native_buffer_ns=%" PRIu64 " native_encode_ns=%" PRIu64
+      " insert_batches=%" PRIu64 " insert_rows=%" PRIu64
       " update_batches=%" PRIu64 " update_rows=%" PRIu64
       " delete_batches=%" PRIu64 " delete_rows=%" PRIu64
       " native_write_bytes=%" PRIu64 " transaction_conflicts=%" PRIu64,
@@ -72,10 +73,11 @@ SessionGwThdContext::~SessionGwThdContext()
       statistics_.cursors_closed, statistics_.operations_opened, statistics_.fetch_batches,
       statistics_.fetched_rows, statistics_.positioned_cache_hits,
       statistics_.positioned_fetches, statistics_.positioned_rows, statistics_.arrow_bytes,
-      statistics_.projected_columns, statistics_.available_columns,
+      statistics_.native_read_bytes, statistics_.projected_columns, statistics_.available_columns,
       statistics_.arrow_decode_nanoseconds,
       statistics_.row_materialize_nanoseconds,
-      statistics_.native_encode_nanoseconds, client.insert_batches,
+      statistics_.native_buffer_nanoseconds, statistics_.native_encode_nanoseconds,
+      client.insert_batches,
       client.insert_rows, client.update_batches, client.update_rows,
       client.delete_batches, client.delete_rows, client.native_write_bytes,
       client.transaction_conflicts);
@@ -174,7 +176,7 @@ void SessionGwThdContext::record_projection(std::size_t projected_columns,
   statistics_.available_columns += available_columns;
 }
 
-void SessionGwThdContext::record_fetch(std::size_t rows, std::size_t arrow_bytes,
+void SessionGwThdContext::record_fetch(std::size_t rows, std::size_t native_read_bytes,
                                        std::uint64_t decode_nanoseconds, bool positioned)
 {
   if (!options_.instrumentation_enabled)
@@ -186,7 +188,7 @@ void SessionGwThdContext::record_fetch(std::size_t rows, std::size_t arrow_bytes
     ++statistics_.positioned_fetches;
     statistics_.positioned_rows += rows;
   }
-  statistics_.arrow_bytes += arrow_bytes;
+  statistics_.native_read_bytes += native_read_bytes;
   statistics_.arrow_decode_nanoseconds += decode_nanoseconds;
 }
 
@@ -200,6 +202,12 @@ void SessionGwThdContext::record_row_materialize(std::uint64_t nanoseconds)
 {
   if (options_.instrumentation_enabled)
     statistics_.row_materialize_nanoseconds += nanoseconds;
+}
+
+void SessionGwThdContext::record_native_buffer(std::uint64_t nanoseconds)
+{
+  if (options_.instrumentation_enabled)
+    statistics_.native_buffer_nanoseconds += nanoseconds;
 }
 
 void SessionGwThdContext::record_native_encode(std::uint64_t nanoseconds)

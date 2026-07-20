@@ -41,7 +41,7 @@ private:
   int materialize_current_row(TABLE *table_arg, unsigned char *record, char *error_buffer,
                               unsigned long error_buffer_size);
   int materialize_row(TABLE *table_arg,
-                      const exasol_gw::ArrowRowBatch &batch,
+                      const exasol_gw::SessionGwNativeFetchResult &batch,
                       const std::vector<exasol_gw::SessionGwRowHandle> &row_handles,
                       std::size_t row,
                       unsigned char *record,
@@ -49,15 +49,17 @@ private:
                       unsigned long error_buffer_size);
   void initialize_column_kinds(TABLE *table_arg);
   std::vector<std::string> initialize_table_scan_columns(TABLE *table_arg);
+  void select_fetch_rows(TABLE *table_arg, bool include_row_handles);
 
   exasol_gw::SessionGwThdContext *session;
   exasol_gw::SessionGwConnection *connection;
   exasol_gw::SessionGwOptions options;
   std::uint64_t cursor_id;
   bool cursor_registered;
-  exasol_gw::ArrowRowBatch current_batch;
+  exasol_gw::SessionGwNativeFetchResult current_batch;
   std::size_t current_row;
   bool end_of_cursor;
+  std::uint32_t fetch_rows;
   std::vector<exasol_gw::ArrowColumnKind> column_kinds;
   std::vector<std::size_t> selected_field_indices;
   std::vector<exasol_gw::SessionGwRowHandle> current_row_handles;

@@ -1181,6 +1181,8 @@ struct InsertContext
     {
       DbugReadSetGuard read_set_guard(table);
       ensure_operation_open(table);
+      const auto buffer_started= session->instrumentation_enabled()
+          ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       if (pending_columns.empty())
       {
         for (Field **field= table->field; *field; ++field)
@@ -1200,6 +1202,10 @@ struct InsertContext
         }
       }
       ++pending_rows;
+      if (session->instrumentation_enabled())
+        session->record_native_buffer(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - buffer_started).count()));
       if (pending_rows >= max_rows_per_batch ||
           estimated_native_batch_bytes(pending_columns) >= 512U * 1024U)
         return flush(table);
@@ -1378,6 +1384,8 @@ struct UpdateContext
       if (update_fields.empty())
         return 0;
       ensure_operation_open(table);
+      const auto buffer_started= session->instrumentation_enabled()
+          ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       if (pending_columns.empty())
       {
         for (Field *field: update_fields)
@@ -1398,6 +1406,10 @@ struct UpdateContext
       }
       pending_handles.push_back(row_handle);
       ++pending_rows;
+      if (session->instrumentation_enabled())
+        session->record_native_buffer(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - buffer_started).count()));
       if (pending_rows >= max_rows_per_batch ||
           estimated_native_batch_bytes(pending_columns) >= 512U * 1024U)
         return flush(table);

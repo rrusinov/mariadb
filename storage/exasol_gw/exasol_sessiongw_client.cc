@@ -185,6 +185,25 @@ public:
     return take_fetch(fetch);
   }
 
+  SessionGwNativeFetchResult fetch_native(std::uint64_t cursor_id, std::uint32_t max_rows,
+                                           std::uint32_t max_bytes)
+  {
+    sessiongw_c_native_fetch *fetch= nullptr;
+    check_sdk(sessiongw_c_fetch_native(require_session(), cursor(cursor_id), max_rows, max_bytes, &fetch));
+    return take_native_fetch(fetch);
+  }
+
+  SessionGwNativeFetchResult fetch_positioned_rows_native(
+      std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
+      std::uint32_t max_bytes)
+  {
+    const auto rows= row_numbers(row_handles);
+    sessiongw_c_native_fetch *fetch= nullptr;
+    check_sdk(sessiongw_c_fetch_positioned_native(require_session(), cursor(cursor_id),
+                                                  rows.data(), rows.size(), max_bytes, &fetch));
+    return take_native_fetch(fetch);
+  }
+
   SessionGwFetchResult fetch_positioned_rows(
       std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
       std::uint32_t max_bytes)
@@ -369,6 +388,53 @@ private:
     return result;
   }
 
+  SessionGwNativeFetchResult take_native_fetch(sessiongw_c_native_fetch *fetch_handle)
+  {
+    std::shared_ptr<void> owner(fetch_handle, [](void *value) {
+      sessiongw_c_native_fetch_destroy(static_cast<sessiongw_c_native_fetch *>(value));
+    });
+    SessionGwNativeFetchResult result;
+    result.cursor_id= sessiongw_c_native_fetch_cursor_id(fetch_handle);
+    result.end_of_cursor= sessiongw_c_native_fetch_end(fetch_handle) != 0;
+    result.row_count= sessiongw_c_native_fetch_row_count(fetch_handle);
+    const std::size_t column_count= sessiongw_c_native_fetch_column_count(fetch_handle);
+    result.columns.reserve(column_count);
+    for (std::size_t column= 0; column < column_count; ++column)
+    {
+      SessionGwNativeColumn view;
+      view.kind= static_cast<SessionGwNativeKind>(
+          sessiongw_c_native_fetch_column_kind(fetch_handle, column));
+      view.scale= sessiongw_c_native_fetch_column_scale(fetch_handle, column);
+      view.nulls= sessiongw_c_native_fetch_column_nulls(fetch_handle, column, &view.nulls_size);
+      view.fixed_data= sessiongw_c_native_fetch_column_fixed_data(
+          fetch_handle, column, &view.fixed_data_size);
+      view.sizes= sessiongw_c_native_fetch_column_sizes(fetch_handle, column, &view.sizes_size);
+      view.variable_data= sessiongw_c_native_fetch_column_variable_data(
+          fetch_handle, column, &view.variable_data_size);
+      if (view.kind == SessionGwNativeKind::utf8)
+      {
+        view.variable_offsets.reserve(result.row_count + 1U);
+        view.variable_offsets.push_back(0U);
+        std::uint64_t offset= 0;
+        for (std::uint32_t row= 0; row < result.row_count; ++row)
+        {
+          std::uint64_t size= 0;
+          for (unsigned byte= 0; byte < 8U; ++byte)
+            size= (size << 8U) | view.sizes[static_cast<std::size_t>(row) * 8U + byte];
+          offset += size;
+          view.variable_offsets.push_back(offset);
+        }
+      }
+      result.columns.push_back(std::move(view));
+    }
+    std::size_t count= 0;
+    const std::uint64_t *rows= sessiongw_c_native_fetch_row_locations(fetch_handle, &count);
+    result.row_handles.reserve(count);
+    for (std::size_t index= 0; index < count; ++index) result.row_handles.push_back({rows[index]});
+    result.owner= std::move(owner);
+    return result;
+  }
+
   SessionGwFetchResult take_fetch(sessiongw_c_fetch *fetch_handle)
   {
     std::unique_ptr<sessiongw_c_fetch, decltype(&sessiongw_c_fetch_destroy)> owner(
@@ -441,6 +507,8 @@ std::string SessionGwConnection::get_table_version(const std::string &schema, co
 SessionGwOpenCursorResult SessionGwConnection::open_pushed_query(const std::string &sql) { return impl_->open_pushed_query(sql); }
 SessionGwOpenCursorResult SessionGwConnection::open_table_scan(const std::string &schema, const std::string &table, const std::vector<std::string> &columns, bool include) { return impl_->open_table_scan(schema, table, columns, include); }
 SessionGwFetchResult SessionGwConnection::fetch(std::uint64_t id, std::uint32_t rows, std::uint32_t bytes) { return impl_->fetch(id, rows, bytes); }
+SessionGwNativeFetchResult SessionGwConnection::fetch_native(std::uint64_t id, std::uint32_t rows, std::uint32_t bytes) { return impl_->fetch_native(id, rows, bytes); }
+SessionGwNativeFetchResult SessionGwConnection::fetch_positioned_rows_native(std::uint64_t id, const std::vector<SessionGwRowHandle> &rows, std::uint32_t bytes) { return impl_->fetch_positioned_rows_native(id, rows, bytes); }
 SessionGwFetchResult SessionGwConnection::fetch_positioned_rows(std::uint64_t id, const std::vector<SessionGwRowHandle> &rows, std::uint32_t bytes) { return impl_->fetch_positioned_rows(id, rows, bytes); }
 void SessionGwConnection::close_cursor(std::uint64_t id) { impl_->close_cursor(id); }
 SessionGwOpenOperationResult SessionGwConnection::open_table_insert(const std::string &schema, const std::string &table, const std::vector<std::string> &columns, std::uint32_t rows, const std::vector<std::uint8_t> &arrow) { return impl_->open_table_insert(schema, table, columns, rows, arrow); }

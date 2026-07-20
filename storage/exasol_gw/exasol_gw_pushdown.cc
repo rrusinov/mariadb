@@ -8,6 +8,7 @@
 #include "sql_class.h"
 #include "tztime.h"
 #include "sql_lex.h"
+#include "my_decimal.h"
 
 #include "exasol_gw_pushdown.h"
 #include "exasol_gw_sql_generator.h"
@@ -92,58 +93,125 @@ class DbugWriteSetGuard
   MY_BITMAP *saved;
 };
 
-std::string apply_decimal_scale(const std::string &integer_value, uint scale)
+std::uint32_t little_u32(const std::uint8_t *bytes)
 {
-  if (scale == 0 || integer_value.empty())
-    return integer_value;
-  bool negative= integer_value[0] == '-';
-  std::string digits= negative ? integer_value.substr(1) : integer_value;
-  while (digits.size() <= scale)
-    digits.insert(digits.begin(), '0');
-  digits.insert(digits.end() - static_cast<std::ptrdiff_t>(scale), '.');
-  return negative ? "-" + digits : digits;
+  std::uint32_t value= 0;
+  for (unsigned index= 0; index < 4U; ++index)
+    value |= static_cast<std::uint32_t>(bytes[index]) << (index * 8U);
+  return value;
 }
 
-std::string utc_timestamp_for_session(Field *field, const std::string &value)
+std::uint64_t little_u64(const std::uint8_t *bytes)
 {
-  MYSQL_TIME utc{};
-  if (std::sscanf(value.c_str(), "%u-%u-%u %u:%u:%u.%lu",
-                  &utc.year, &utc.month, &utc.day, &utc.hour, &utc.minute,
-                  &utc.second, &utc.second_part) != 7)
-    throw std::runtime_error("invalid UTC timestamp returned by SessionGW");
-  utc.time_type= MYSQL_TIMESTAMP_DATETIME;
-
-  THD *thd= field->table ? field->table->in_use : nullptr;
-  if (!thd || !thd->variables.time_zone)
-    throw std::runtime_error("MariaDB session timezone is unavailable for TIMESTAMP conversion");
-  const longlong unix_days=
-      static_cast<longlong>(calc_daynr(utc.year, utc.month, utc.day)) -
-      static_cast<longlong>(calc_daynr(1970, 1, 1));
-  const __int128 utc_seconds_wide=
-      static_cast<__int128>(unix_days) * 86400 + utc.hour * 3600U +
-      utc.minute * 60U + utc.second;
-  if (utc_seconds_wide < std::numeric_limits<my_time_t>::min() ||
-      utc_seconds_wide > std::numeric_limits<my_time_t>::max())
-    throw std::runtime_error("SessionGW UTC timestamp is outside MariaDB TIMESTAMP range");
-  const my_time_t utc_seconds= static_cast<my_time_t>(utc_seconds_wide);
-  MYSQL_TIME local{};
-  thd->variables.time_zone->gmt_sec_to_TIME(&local, utc_seconds);
-
-  char formatted[64];
-  std::snprintf(formatted, sizeof(formatted), "%04u-%02u-%02u %02u:%02u:%02u.%06lu",
-                local.year, local.month, local.day, local.hour, local.minute,
-                local.second, utc.second_part);
-  return formatted;
+  std::uint64_t value= 0;
+  for (unsigned index= 0; index < 8U; ++index)
+    value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8U);
+  return value;
 }
 
-std::string cell_value_for_field(Field *field, const exasol_gw::ArrowCell &cell)
+std::int64_t little_i64(const std::uint8_t *bytes)
 {
-  if (field->type() == MYSQL_TYPE_DECIMAL || field->type() == MYSQL_TYPE_NEWDECIMAL)
-    return apply_decimal_scale(cell.value, field->decimals());
-  if (field->real_type() == MYSQL_TYPE_TIMESTAMP ||
-      field->real_type() == MYSQL_TYPE_TIMESTAMP2)
-    return utc_timestamp_for_session(field, cell.value);
-  return cell.value;
+  return static_cast<std::int64_t>(little_u64(bytes));
+}
+
+void civil_from_days(std::int64_t days, MYSQL_TIME *value)
+{
+  std::int64_t z= days + 719468;
+  const std::int64_t era= (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe= static_cast<unsigned>(z - era * 146097);
+  const unsigned yoe= (doe - doe / 1460U + doe / 36524U - doe / 146096U) / 365U;
+  std::int64_t year= static_cast<std::int64_t>(yoe) + era * 400;
+  const unsigned doy= doe - (365U * yoe + yoe / 4U - yoe / 100U);
+  const unsigned mp= (5U * doy + 2U) / 153U;
+  value->day= doy - (153U * mp + 2U) / 5U + 1U;
+  value->month= mp + (mp < 10U ? 3U : static_cast<unsigned>(-9));
+  year += value->month <= 2U;
+  if (year < 0 || year > 9999)
+    throw std::runtime_error("SessionGW temporal value is outside MariaDB range");
+  value->year= static_cast<unsigned>(year);
+}
+
+MYSQL_TIME native_date(std::int32_t days)
+{
+  MYSQL_TIME value{};
+  civil_from_days(days, &value);
+  value.time_type= MYSQL_TIMESTAMP_DATE;
+  return value;
+}
+
+MYSQL_TIME native_timestamp(Field *field, std::int64_t nanoseconds)
+{
+  std::int64_t seconds= nanoseconds / 1000000000LL;
+  std::int64_t nanos= nanoseconds % 1000000000LL;
+  if (nanos < 0) { --seconds; nanos += 1000000000LL; }
+  MYSQL_TIME value{};
+  if (field->real_type() == MYSQL_TYPE_TIMESTAMP || field->real_type() == MYSQL_TYPE_TIMESTAMP2)
+  {
+    THD *thd= field->table ? field->table->in_use : nullptr;
+    if (!thd || !thd->variables.time_zone)
+      throw std::runtime_error("MariaDB session timezone is unavailable for TIMESTAMP conversion");
+    if (seconds < std::numeric_limits<my_time_t>::min() ||
+        seconds > std::numeric_limits<my_time_t>::max())
+      throw std::runtime_error("SessionGW UTC timestamp is outside MariaDB TIMESTAMP range");
+    thd->variables.time_zone->gmt_sec_to_TIME(&value, static_cast<my_time_t>(seconds));
+  }
+  else
+  {
+    std::int64_t days= seconds / 86400LL;
+    std::int64_t day_seconds= seconds % 86400LL;
+    if (day_seconds < 0) { --days; day_seconds += 86400LL; }
+    civil_from_days(days, &value);
+    value.hour= static_cast<unsigned>(day_seconds / 3600LL);
+    value.minute= static_cast<unsigned>((day_seconds % 3600LL) / 60LL);
+    value.second= static_cast<unsigned>(day_seconds % 60LL);
+  }
+  value.second_part= static_cast<unsigned long>(nanos / 1000LL);
+  value.time_type= MYSQL_TIMESTAMP_DATETIME;
+  return value;
+}
+
+my_decimal native_decimal(const std::uint8_t *bytes, unsigned width, unsigned scale)
+{
+  unsigned __int128 encoded= 0;
+  for (unsigned index= 0; index < width; ++index)
+    encoded |= static_cast<unsigned __int128>(bytes[index]) << (index * 8U);
+  const bool negative= (bytes[width - 1U] & 0x80U) != 0U;
+  if (negative && width < 16U)
+    encoded |= (~static_cast<unsigned __int128>(0U)) << (width * 8U);
+  unsigned __int128 magnitude= negative ? (~encoded + 1U) : encoded;
+  unsigned digits= 1U;
+  for (unsigned __int128 copy= magnitude; copy >= 10U; copy /= 10U) ++digits;
+  const unsigned integer_digits= digits > scale ? digits - scale : 1U;
+  const unsigned integer_groups= (integer_digits + 8U) / 9U;
+  const unsigned fractional_groups= (scale + 8U) / 9U;
+  const unsigned groups= integer_groups + fractional_groups;
+  if (groups > DECIMAL_BUFF_LENGTH)
+    throw std::runtime_error("SessionGW decimal exceeds MariaDB decimal buffer");
+
+  my_decimal result;
+  result.sign(negative);
+  result.intg= integer_digits;
+  result.frac= scale;
+  std::fill(result.buf, result.buf + DECIMAL_BUFF_LENGTH, 0);
+  int target= static_cast<int>(groups) - 1;
+  const unsigned partial_fraction= scale % 9U;
+  if (partial_fraction != 0U)
+  {
+    unsigned __int128 divisor= 1U;
+    for (unsigned index= 0; index < partial_fraction; ++index) divisor *= 10U;
+    unsigned __int128 padding= 1U;
+    for (unsigned index= partial_fraction; index < 9U; ++index) padding *= 10U;
+    result.buf[target--]= static_cast<decimal_digit_t>((magnitude % divisor) * padding);
+    magnitude /= divisor;
+  }
+  while (target >= 0)
+  {
+    result.buf[target--]= static_cast<decimal_digit_t>(magnitude % 1000000000U);
+    magnitude /= 1000000000U;
+  }
+  if (magnitude != 0U)
+    throw std::runtime_error("SessionGW decimal magnitude exceeds MariaDB precision");
+  return result;
 }
 
 void set_query_from_generated_sql(String *query,
@@ -237,7 +305,8 @@ ha_exasol_gw_cursor::ha_exasol_gw_cursor(THD *thd_arg)
     cursor_id(0),
     cursor_registered(false),
     current_row(0),
-    end_of_cursor(false)
+    end_of_cursor(false),
+    fetch_rows(1024)
 {
   DBUG_EXECUTE_IF("exasol_gw_cursor_constructor_oom", throw std::bad_alloc(););
 }
@@ -302,6 +371,33 @@ std::vector<std::string> ha_exasol_gw_cursor::initialize_table_scan_columns(TABL
   return columns;
 }
 
+void ha_exasol_gw_cursor::select_fetch_rows(TABLE *table_arg, bool include_row_handles)
+{
+  if (options.fetch_rows != 0U)
+  {
+    fetch_rows= options.fetch_rows;
+    return;
+  }
+  // Narrow row-location scans stay at the proven 1K lifecycle batch. Wide
+  // scans target about 4 MiB from projected MariaDB width, bounded to avoid
+  // request fan-out and oversized frames.
+  std::uint64_t projected_width= 0;
+  for (const std::size_t index : selected_field_indices)
+  {
+    const std::uint64_t width= table_arg->field[index]->pack_length();
+    projected_width += std::max<std::uint64_t>(1U, std::min<std::uint64_t>(width, 256U));
+  }
+  projected_width= std::max<std::uint64_t>(projected_width, 1U);
+  if (include_row_handles && projected_width < 128U)
+  {
+    fetch_rows= 1024U;
+    return;
+  }
+  const std::uint64_t target_rows= (4U * 1024U * 1024U) / projected_width;
+  fetch_rows= static_cast<std::uint32_t>(
+      std::max<std::uint64_t>(1024U, std::min<std::uint64_t>(10000U, target_rows)));
+}
+
 int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
                                               const char *query_text,
                                               char *error_buffer,
@@ -311,12 +407,13 @@ int ha_exasol_gw_cursor::open_pushed_query(TABLE *table_arg,
   {
     connection= &session->connection();
     initialize_column_kinds(table_arg);
+    select_fetch_rows(table_arg, false);
     exasol_gw::SessionGwOpenCursorResult opened=
         connection->open_pushed_query(query_text ? std::string(query_text) : std::string());
     cursor_id= opened.cursor_id;
     session->read_cursor_opened();
     cursor_registered= true;
-    current_batch= exasol_gw::ArrowRowBatch();
+    current_batch= exasol_gw::SessionGwNativeFetchResult();
     current_row= 0;
     end_of_cursor= false;
     return 0;
@@ -337,12 +434,13 @@ int ha_exasol_gw_cursor::open_table_scan(TABLE *table_arg,
   {
     connection= &session->connection();
     const std::vector<std::string> columns= initialize_table_scan_columns(table_arg);
+    select_fetch_rows(table_arg, include_row_handles);
     exasol_gw::SessionGwOpenCursorResult opened=
         connection->open_table_scan(table_schema_name(table_arg), table_object_name(table_arg), columns, include_row_handles);
     cursor_id= opened.cursor_id;
     session->read_cursor_opened();
     cursor_registered= true;
-    current_batch= exasol_gw::ArrowRowBatch();
+    current_batch= exasol_gw::SessionGwNativeFetchResult();
     current_row= 0;
     end_of_cursor= false;
     return 0;
@@ -360,18 +458,16 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
   {
     while (!end_of_cursor)
     {
-      exasol_gw::SessionGwFetchResult fetched= connection->fetch(cursor_id, options.fetch_rows, 0);
-      end_of_cursor= fetched.end_of_cursor;
-      const auto decode_started= options.instrumentation_enabled
-          ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      current_batch= exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
-      const std::uint64_t decode_nanoseconds= options.instrumentation_enabled
-          ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - decode_started).count()) : 0U;
-      session->record_fetch(current_batch.rows, fetched.arrow_batch.size(), decode_nanoseconds);
-      current_row_handles= fetched.row_handles;
+      current_batch= connection->fetch_native(cursor_id, fetch_rows, 0);
+      end_of_cursor= current_batch.end_of_cursor;
+      std::uint64_t native_bytes= 0;
+      for (const auto &column : current_batch.columns)
+        native_bytes += column.nulls_size + column.fixed_data_size +
+                        column.sizes_size + column.variable_data_size;
+      session->record_fetch(current_batch.row_count, native_bytes, 0U);
+      current_row_handles= current_batch.row_handles;
       current_row= 0;
-      if (current_batch.rows > 0)
+      if (current_batch.row_count > 0)
         return 0;
       if (end_of_cursor)
         return HA_ERR_END_OF_FILE;
@@ -387,14 +483,14 @@ int ha_exasol_gw_cursor::fetch_next_batch(char *error_buffer, unsigned long erro
 
 int ha_exasol_gw_cursor::materialize_row(
     TABLE *table_arg,
-    const exasol_gw::ArrowRowBatch &batch,
+    const exasol_gw::SessionGwNativeFetchResult &batch,
     const std::vector<exasol_gw::SessionGwRowHandle> &row_handles,
     std::size_t row,
     unsigned char *,
     char *error_buffer,
     unsigned long error_buffer_size)
 {
-  if (!table_arg || row >= batch.rows)
+  if (!table_arg || row >= batch.row_count)
     return HA_ERR_END_OF_FILE;
   try
   {
@@ -402,27 +498,77 @@ int ha_exasol_gw_cursor::materialize_row(
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     DbugWriteSetGuard write_set_guard(table_arg);
     if (batch.columns.size() != selected_field_indices.size())
-      throw std::runtime_error("SessionGW Arrow column count does not match projected MariaDB fields");
+      throw std::runtime_error("SessionGW native column count does not match projected MariaDB fields");
     for (std::size_t column= 0; column < selected_field_indices.size(); ++column)
     {
       Field *field= table_arg->field[selected_field_indices[column]];
-      const exasol_gw::ArrowCell &cell= batch.columns[column][row];
-      if (cell.is_null)
+      const exasol_gw::SessionGwNativeColumn &values= batch.columns[column];
+      if (values.nulls == nullptr || row >= values.nulls_size)
+        throw std::runtime_error("SessionGW native NULL vector is truncated");
+      if (values.nulls[row] == 0xffU)
       {
         field->set_null();
+        continue;
       }
-      else
+      if (values.nulls[row] != 0x00U)
+        throw std::runtime_error("SessionGW native NULL vector contains an invalid value");
+      field->set_notnull();
+      switch (values.kind)
       {
-        field->set_notnull();
-        if (field->real_type() == MYSQL_TYPE_BIT)
-        {
-          field->store(cell.value == "1" ? 1LL : 0LL, true);
-        }
-        else
-        {
-          const std::string value= cell_value_for_field(field, cell);
-          field->store(value.data(), value.size(), &my_charset_bin);
-        }
+      case exasol_gw::SessionGwNativeKind::boolean:
+        field->store(static_cast<longlong>(values.fixed_data[row]), true);
+        break;
+      case exasol_gw::SessionGwNativeKind::int64:
+        field->store(static_cast<longlong>(little_i64(values.fixed_data + row * 8U)),
+                     (field->flags & UNSIGNED_FLAG) != 0U);
+        break;
+      case exasol_gw::SessionGwNativeKind::double64:
+      {
+        const std::uint64_t bits= little_u64(values.fixed_data + row * 8U);
+        double value= 0;
+        std::memcpy(&value, &bits, sizeof(value));
+        field->store(value);
+        break;
+      }
+      case exasol_gw::SessionGwNativeKind::decimal32:
+      case exasol_gw::SessionGwNativeKind::decimal64:
+      case exasol_gw::SessionGwNativeKind::decimal128:
+      {
+        const unsigned width= values.kind == exasol_gw::SessionGwNativeKind::decimal32 ? 4U :
+            (values.kind == exasol_gw::SessionGwNativeKind::decimal64 ? 8U : 16U);
+        my_decimal value= native_decimal(values.fixed_data + row * width, width,
+                                         static_cast<unsigned>(values.scale));
+        field->store_decimal(&value);
+        break;
+      }
+      case exasol_gw::SessionGwNativeKind::date32:
+      {
+        MYSQL_TIME value= native_date(static_cast<std::int32_t>(
+            little_u32(values.fixed_data + row * 4U)));
+        field->store_time_dec(&value, field->decimals());
+        break;
+      }
+      case exasol_gw::SessionGwNativeKind::timestamp_ns:
+      {
+        MYSQL_TIME value= native_timestamp(field, little_i64(values.fixed_data + row * 8U));
+        field->store_time_dec(&value, field->decimals());
+        break;
+      }
+      case exasol_gw::SessionGwNativeKind::utf8:
+      {
+        if (values.variable_offsets.size() != batch.row_count + 1U)
+          throw std::runtime_error("SessionGW native string offsets are invalid");
+        const std::uint64_t begin= values.variable_offsets[row];
+        const std::uint64_t end= values.variable_offsets[row + 1U];
+        if (begin > end || end > values.variable_data_size)
+          throw std::runtime_error("SessionGW native string extent is invalid");
+        const char *data= begin == end ? "" :
+            reinterpret_cast<const char *>(values.variable_data + begin);
+        field->store(data, static_cast<std::size_t>(end - begin), &my_charset_bin);
+        break;
+      }
+      default:
+        throw std::runtime_error("SessionGW native column kind is unsupported");
       }
     }
     if (row < row_handles.size())
@@ -457,7 +603,7 @@ int ha_exasol_gw_cursor::fetch_row(TABLE *table_arg,
                                       char *error_buffer,
                                       unsigned long error_buffer_size)
 {
-  if (current_row >= current_batch.rows)
+  if (current_row >= current_batch.row_count)
   {
     const int rc= fetch_next_batch(error_buffer, error_buffer_size);
     if (rc != 0)
@@ -487,21 +633,18 @@ int ha_exasol_gw_cursor::fetch_positioned_row(
 
     const std::vector<exasol_gw::SessionGwRowHandle> row_handles{row_handle};
     // A miss is a dedicated vector positioned-read message, never a cursor lifecycle.
-    const exasol_gw::SessionGwFetchResult fetched=
-        connection->fetch_positioned_rows(cursor_id, row_handles);
-    const auto decode_started= options.instrumentation_enabled
-        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const exasol_gw::ArrowRowBatch batch=
-        exasol_gw::decode_arrow_record_batch(fetched.arrow_batch, column_kinds);
-    const std::uint64_t decode_nanoseconds= options.instrumentation_enabled
-        ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - decode_started).count()) : 0U;
-    session->record_fetch(batch.rows, fetched.arrow_batch.size(), decode_nanoseconds, true);
-    if (batch.rows == 0)
+    const exasol_gw::SessionGwNativeFetchResult fetched=
+        connection->fetch_positioned_rows_native(cursor_id, row_handles);
+    std::uint64_t native_bytes= 0;
+    for (const auto &column : fetched.columns)
+      native_bytes += column.nulls_size + column.fixed_data_size +
+                      column.sizes_size + column.variable_data_size;
+    session->record_fetch(fetched.row_count, native_bytes, 0U, true);
+    if (fetched.row_count == 0)
       return HA_ERR_END_OF_FILE;
-    if (batch.rows != 1)
+    if (fetched.row_count != 1)
       throw std::runtime_error("SessionGW positioned fetch returned an unexpected row count");
-    return materialize_row(table_arg, batch, row_handles, 0, record, error_buffer, error_buffer_size);
+    return materialize_row(table_arg, fetched, row_handles, 0, record, error_buffer, error_buffer_size);
   }
   catch (...)
   {

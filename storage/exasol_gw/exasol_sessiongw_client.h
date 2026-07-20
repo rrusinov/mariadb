@@ -54,7 +54,8 @@ struct SessionGwOptions
   std::string password= "exasol";
   std::string tls_mode= "skip_verify"; // verify, skip_verify, plain
   std::string ca_file;
-  std::uint32_t fetch_rows= 1024;
+  // Zero selects projection-aware sizing in the storage engine.
+  std::uint32_t fetch_rows= 0;
   bool instrumentation_enabled= false;
 };
 
@@ -93,6 +94,45 @@ struct SessionGwFetchResult
   std::vector<SessionGwRowHandle> row_handles;
 };
 
+enum class SessionGwNativeKind: std::uint8_t
+{
+  boolean= 1,
+  int64= 2,
+  double64= 3,
+  decimal128= 4,
+  date32= 5,
+  timestamp_ns= 6,
+  utf8= 7,
+  decimal32= 8,
+  decimal64= 9
+};
+
+struct SessionGwNativeColumn
+{
+  SessionGwNativeKind kind{};
+  std::int32_t scale= 0;
+  const std::uint8_t *nulls= nullptr;
+  std::size_t nulls_size= 0;
+  const std::uint8_t *fixed_data= nullptr;
+  std::size_t fixed_data_size= 0;
+  const std::uint8_t *sizes= nullptr;
+  std::size_t sizes_size= 0;
+  const std::uint8_t *variable_data= nullptr;
+  std::size_t variable_data_size= 0;
+  std::vector<std::uint64_t> variable_offsets;
+};
+
+struct SessionGwNativeFetchResult
+{
+  std::uint64_t cursor_id= 0;
+  bool end_of_cursor= false;
+  std::uint32_t row_count= 0;
+  std::vector<SessionGwNativeColumn> columns;
+  std::vector<SessionGwRowHandle> row_handles;
+  // Retains the SDK-owned borrowed views above.
+  std::shared_ptr<void> owner;
+};
+
 struct SessionGwDescribeTableResult
 {
   std::string schema_name;
@@ -127,7 +167,7 @@ public:
                                               const std::string &table);
   std::string get_table_version(const std::string &schema, const std::string &table);
   SessionGwOpenCursorResult open_pushed_query(const std::string &sql);
-  // Opens a forward scan; explicit positions use fetch_positioned_rows().
+  // Opens a forward scan; explicit positions use fetch_positioned_rows_native().
   SessionGwOpenCursorResult open_table_scan(const std::string &schema,
                                             const std::string &table,
                                             const std::vector<std::string> &columns,
@@ -161,7 +201,14 @@ public:
   SessionGwFetchResult fetch(std::uint64_t cursor_id,
                              std::uint32_t max_rows,
                              std::uint32_t max_bytes= 0);
-  // Fetches explicit logical rows without opening or closing a cursor.
+  // Native batches avoid Arrow data IPC and string conversion in MariaDB.
+  SessionGwNativeFetchResult fetch_native(std::uint64_t cursor_id,
+                                          std::uint32_t max_rows,
+                                          std::uint32_t max_bytes= 0);
+  SessionGwNativeFetchResult fetch_positioned_rows_native(
+      std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
+      std::uint32_t max_bytes= 0);
+  // Arrow remains available for compatibility and generic consumers.
   SessionGwFetchResult fetch_positioned_rows(
       std::uint64_t cursor_id, const std::vector<SessionGwRowHandle> &row_handles,
       std::uint32_t max_bytes= 0);
