@@ -14,6 +14,7 @@
 /.cproject
 /.project
 .gdb_history
+.pi-subagents/
 .vs/
 /.settings/
 errmsg.sys
@@ -373,7 +374,7 @@ zzz/*
 [Rr]eleases/
 x64/
 x86/
-build/
+build*/
 bld/
 [Bb]in/
 /cmake-build-debug/
