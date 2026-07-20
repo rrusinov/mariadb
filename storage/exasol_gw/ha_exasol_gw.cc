@@ -2388,7 +2388,7 @@ maria_declare_plugin(exasol_gw)
   &exasol_gw_storage_engine,
   "EXASOL",
   "Exasol",
-  "EXASOL Session Gateway proxy storage engine",
+  "Exasol Gateway proxy storage engine",
   PLUGIN_LICENSE_GPL,
   exasol_gw_init,
   exasol_gw_done,

@@ -122,7 +122,7 @@ SessionGwThdContext::SessionGwThdContext(THD *thd): thd_(thd)
   {
     throw SessionGwError(
         SessionGwErrorCategory::not_authorized,
-        "EXASOL SessionGateway identity mode is not configured; set "
+        "Exasol Gateway identity mode is not configured; set "
         "EXASOL_SESSIONGW_IDENTITY_MODE=service_account explicitly");
   }
 
@@ -137,7 +137,7 @@ SessionGwThdContext::SessionGwThdContext(THD *thd): thd_(thd)
     throw SessionGwError(
         SessionGwErrorCategory::not_authorized,
         "MariaDB principal '" + authenticated_principal_ +
-            "' is not authorized to use the EXASOL SessionGateway service account");
+            "' is not authorized to use the Exasol Gateway service account");
   }
   options_.client_name= audit_client_name(user, host);
 }
@@ -148,7 +148,7 @@ void SessionGwThdContext::validate_authenticated_principal(const THD *thd) const
   {
     throw SessionGwError(
         SessionGwErrorCategory::not_authorized,
-        "MariaDB authenticated principal changed while an EXASOL SessionGateway "
+        "MariaDB authenticated principal changed while an Exasol Gateway "
         "context was active; reconnect before using EXASOL tables");
   }
 }

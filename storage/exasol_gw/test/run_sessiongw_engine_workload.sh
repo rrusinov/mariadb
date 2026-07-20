@@ -377,7 +377,13 @@ if [[ "$EXASOL_TRANSACTIONS" != "YES" ]]; then
     echo "EXASOL must advertise full commit/rollback support, got: $EXASOL_TRANSACTIONS" >&2
     exit 1
 fi
-log "PASS show engines and transaction capability = $EXASOL_TRANSACTIONS"
+EXASOL_ENGINE_COMMENT=$(mysql --batch --raw --skip-column-names -e \
+    "SELECT COMMENT FROM INFORMATION_SCHEMA.ENGINES WHERE ENGINE='EXASOL'")
+if [[ "$EXASOL_ENGINE_COMMENT" != "Exasol Gateway proxy storage engine" ]]; then
+    echo "Unexpected EXASOL product description: $EXASOL_ENGINE_COMMENT" >&2
+    exit 1
+fi
+log "PASS show engines product and transaction capability = Exasol Gateway / $EXASOL_TRANSACTIONS"
 
 mysql --table <<SQL | tee -a "$REPORT"
 DROP DATABASE IF EXISTS $SCHEMA;
@@ -431,7 +437,7 @@ if mysql --user=denied -e "USE $SCHEMA; SELECT COUNT(*) FROM T" >"$IDENTITY_DENI
     echo "Unlisted MariaDB identity unexpectedly used the EXASOL service account" >&2
     exit 1
 fi
-if ! grep -Fq "is not authorized to use the EXASOL SessionGateway service account" "$IDENTITY_DENIED_OUT"; then
+if ! grep -Fq "is not authorized to use the Exasol Gateway service account" "$IDENTITY_DENIED_OUT"; then
     echo "Unlisted MariaDB identity did not fail with the identity policy diagnostic" >&2
     cat "$IDENTITY_DENIED_OUT" >&2
     exit 1
