@@ -52,6 +52,7 @@ struct SessionGwOptions
   std::uint16_t port= 8563;
   std::string user= "sys";
   std::string password= "exasol";
+  std::string client_name= "ExasolGateway";
   std::string tls_mode= "skip_verify"; // verify, skip_verify, plain
   std::string ca_file;
   // Zero selects projection-aware sizing in the storage engine.

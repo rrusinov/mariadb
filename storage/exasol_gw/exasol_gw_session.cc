@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <inttypes.h>
 #include <stdexcept>
 #include <thread>
@@ -20,6 +21,75 @@ namespace exasol_gw
 
 namespace
 {
+std::string trim_identity_token(const std::string &value)
+{
+  const std::size_t first= value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos)
+    return {};
+  const std::size_t last= value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1U);
+}
+
+std::string authenticated_principal(const THD *thd)
+{
+  const char *authenticated_user= thd->main_security_ctx.user;
+  const char *authenticated_host= thd->main_security_ctx.host_or_ip;
+  const std::string user= authenticated_user == nullptr ? "" : authenticated_user;
+  const std::string host= authenticated_host == nullptr ? "" : authenticated_host;
+  return user + "@" + host;
+}
+
+bool identity_is_allowed(const std::string &allowed, const std::string &user,
+                         const std::string &principal)
+{
+  std::size_t offset= 0;
+  while (offset <= allowed.size())
+  {
+    const std::size_t comma= allowed.find(',', offset);
+    const std::string token= trim_identity_token(
+        allowed.substr(offset, comma == std::string::npos ? std::string::npos : comma - offset));
+    if (token == "*" || token == user || token == principal)
+      return true;
+    if (comma == std::string::npos)
+      break;
+    offset= comma + 1U;
+  }
+  return false;
+}
+
+std::string audit_identity_component(const std::string &value)
+{
+  static constexpr char hex[]= "0123456789ABCDEF";
+  std::string result;
+  result.reserve(value.size());
+  for (const unsigned char byte: value)
+  {
+    const bool safe= (byte >= 'a' && byte <= 'z') ||
+                     (byte >= 'A' && byte <= 'Z') ||
+                     (byte >= '0' && byte <= '9') || byte == '_' ||
+                     byte == '-' || byte == '.' || byte == ':';
+    if (safe)
+      result.push_back(static_cast<char>(byte));
+    else
+    {
+      result.push_back('%');
+      result.push_back(hex[byte >> 4U]);
+      result.push_back(hex[byte & 0x0fU]);
+    }
+  }
+  return result;
+}
+
+std::string audit_client_name(const std::string &user, const std::string &host)
+{
+  std::string result= "ExasolGateway MariaDB " + audit_identity_component(user) +
+                      "@" + audit_identity_component(host);
+  constexpr std::size_t max_client_name_bytes= 255U;
+  if (result.size() > max_client_name_bytes)
+    result.resize(max_client_name_bytes);
+  return result;
+}
+
 std::uint64_t connect_with_retry(SessionGwConnection &connection, const SessionGwOptions &options)
 {
   // Only bootstrap of a fresh physical session is repeated here. No cursor or
@@ -44,6 +114,44 @@ std::uint64_t connect_with_retry(SessionGwConnection &connection, const SessionG
   }
 }
 } // namespace
+
+SessionGwThdContext::SessionGwThdContext(THD *thd): thd_(thd)
+{
+  const char *mode= std::getenv("EXASOL_SESSIONGW_IDENTITY_MODE");
+  if (mode == nullptr || std::string(mode) != "service_account")
+  {
+    throw SessionGwError(
+        SessionGwErrorCategory::not_authorized,
+        "EXASOL SessionGateway identity mode is not configured; set "
+        "EXASOL_SESSIONGW_IDENTITY_MODE=service_account explicitly");
+  }
+
+  const char *authenticated_user= thd_->main_security_ctx.user;
+  const char *authenticated_host= thd_->main_security_ctx.host_or_ip;
+  const std::string user= authenticated_user == nullptr ? "" : authenticated_user;
+  const std::string host= authenticated_host == nullptr ? "" : authenticated_host;
+  authenticated_principal_= authenticated_principal(thd_);
+  const char *allowed= std::getenv("EXASOL_SESSIONGW_ALLOWED_MARIADB_USERS");
+  if (allowed == nullptr || !identity_is_allowed(allowed, user, authenticated_principal_))
+  {
+    throw SessionGwError(
+        SessionGwErrorCategory::not_authorized,
+        "MariaDB principal '" + authenticated_principal_ +
+            "' is not authorized to use the EXASOL SessionGateway service account");
+  }
+  options_.client_name= audit_client_name(user, host);
+}
+
+void SessionGwThdContext::validate_authenticated_principal(const THD *thd) const
+{
+  if (authenticated_principal(thd) != authenticated_principal_)
+  {
+    throw SessionGwError(
+        SessionGwErrorCategory::not_authorized,
+        "MariaDB authenticated principal changed while an EXASOL SessionGateway "
+        "context was active; reconnect before using EXASOL tables");
+  }
+}
 
 SessionGwThdContext::~SessionGwThdContext()
 {
@@ -380,6 +488,7 @@ SessionGwThdContext &session_for_thd(THD *thd)
     context= new SessionGwThdContext(thd);
     thd_set_ha_data(thd, exasol_gw_hton, context);
   }
+  context->validate_authenticated_principal(thd);
   return *context;
 }
 

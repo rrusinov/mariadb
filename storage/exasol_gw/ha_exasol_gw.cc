@@ -2294,7 +2294,10 @@ static int exasol_gw_commit(THD *thd, bool all)
   {
     exasol_gw::SessionGwThdContext *context= exasol_gw_thd_context(thd);
     if (context)
+    {
+      context->validate_authenticated_principal(thd);
       context->commit_transaction(all);
+    }
     return 0;
   }
   catch (...)

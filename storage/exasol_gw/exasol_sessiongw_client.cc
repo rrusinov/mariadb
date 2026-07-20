@@ -116,7 +116,8 @@ public:
   {
     close_noexcept();
     const sessiongw_c_options converted= c_options(options);
-    check_sdk(sessiongw_c_connect(&converted, &session_));
+    check_sdk(sessiongw_c_connect_with_client_name(
+        &converted, options.client_name.c_str(), &session_));
     instrumentation_enabled_= options.instrumentation_enabled;
   }
 

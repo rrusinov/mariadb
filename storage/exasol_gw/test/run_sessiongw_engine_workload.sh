@@ -345,6 +345,8 @@ EXASOL_SESSIONGW_HOST=localhost \
 EXASOL_SESSIONGW_PORT=$EXASOL_PORT \
 EXASOL_SESSIONGW_USER=sys \
 EXASOL_SESSIONGW_PASSWORD=exasol \
+EXASOL_SESSIONGW_IDENTITY_MODE=service_account \
+EXASOL_SESSIONGW_ALLOWED_MARIADB_USERS="$(id -un)" \
 EXASOL_SESSIONGW_TLS=skip_verify \
 EXASOL_SESSIONGW_INSTRUMENTATION=${EXASOL_SESSIONGW_INSTRUMENTATION:-1} \
 EXASOL_SESSIONGW_FETCH_ROWS=$SESSIONGW_FETCH_ROWS \
@@ -417,6 +419,28 @@ if [[ ! "$STATS_REFRESH_METRICS" =~ metadata_hits=[1-9][0-9]*\ metadata_misses=1
 fi
 log "PASS planner statistics five-second freshness and cache instrumentation = $STATS_REFRESH_ROWS"
 log "PASS ddl insert update delete scan"
+
+if ! grep -R -Fq "ATTR_CLIENTNAME: ExasolGateway MariaDB $(id -un)@" "$NANO_BASE/exa/logs"; then
+    echo "Exasol session audit identity did not contain the authenticated MariaDB principal" >&2
+    exit 1
+fi
+log "PASS authenticated MariaDB identity appears in Exasol client audit attribute"
+
+IDENTITY_DENIED_OUT="$BASE_DIR/identity-denied.out"
+if mysql --user=denied -e "USE $SCHEMA; SELECT COUNT(*) FROM T" >"$IDENTITY_DENIED_OUT" 2>&1; then
+    echo "Unlisted MariaDB identity unexpectedly used the EXASOL service account" >&2
+    exit 1
+fi
+if ! grep -Fq "is not authorized to use the EXASOL SessionGateway service account" "$IDENTITY_DENIED_OUT"; then
+    echo "Unlisted MariaDB identity did not fail with the identity policy diagnostic" >&2
+    cat "$IDENTITY_DENIED_OUT" >&2
+    exit 1
+fi
+if grep -R -Fq "ATTR_CLIENTNAME: ExasolGateway MariaDB denied@" "$NANO_BASE/exa/logs"; then
+    echo "Unlisted MariaDB identity opened an Exasol session before admission failed" >&2
+    exit 1
+fi
+log "PASS unlisted MariaDB identity cannot use EXASOL service account"
 
 mysql -e "USE $SCHEMA; CREATE TABLE META_GUARD(ID INT, NAME VARCHAR(20)) ENGINE=EXASOL; INSERT INTO META_GUARD VALUES (1, 'bound'); SELECT * FROM META_GUARD" >/dev/null
 sql_exasol "DROP TABLE $SCHEMA.META_GUARD" >/dev/null

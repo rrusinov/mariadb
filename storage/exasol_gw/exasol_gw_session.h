@@ -42,9 +42,10 @@ struct SessionGwAdapterStatistics
 class SessionGwThdContext
 {
 public:
-  explicit SessionGwThdContext(THD *thd): thd_(thd) {}
+  explicit SessionGwThdContext(THD *thd);
   ~SessionGwThdContext();
 
+  void validate_authenticated_principal(const THD *thd) const;
   SessionGwConnection &connection();
   void participate_in_statement(bool explicit_transaction);
   void commit_transaction(bool all);
@@ -79,6 +80,7 @@ private:
   void finish_transaction_boundary();
 
   THD *thd_;
+  std::string authenticated_principal_;
   SessionGwOptions options_= options_from_environment();
   SessionGwConnection connection_;
   bool connected_= false;
