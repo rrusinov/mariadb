@@ -54,7 +54,13 @@ SessionGwThdContext::~SessionGwThdContext()
       "SessionGW performance: connection_attempts=%" PRIu64
       " connection_retries=%" PRIu64 " requests=%" PRIu64
       " request_bytes=%" PRIu64 " response_bytes=%" PRIu64
-      " network_ns=%" PRIu64 " metadata_hits=%" PRIu64
+      " network_ns=%" PRIu64 " transport_read_calls=%" PRIu64
+      " transport_read_iterations=%" PRIu64
+      " transport_read_bytes=%" PRIu64 " transport_read_ns=%" PRIu64
+      " websocket_header_calls=%" PRIu64 " websocket_header_ns=%" PRIu64
+      " websocket_payload_calls=%" PRIu64 " websocket_payload_ns=%" PRIu64
+      " frame_decode_ns=%" PRIu64 " native_fetch_ns=%" PRIu64
+      " metadata_hits=%" PRIu64
       " metadata_misses=%" PRIu64 " cursors_opened=%" PRIu64
       " cursors_closed=%" PRIu64 " operations=%" PRIu64 " fetch_batches=%" PRIu64
       " fetched_rows=%" PRIu64 " positioned_cache_hits=%" PRIu64
@@ -68,7 +74,13 @@ SessionGwThdContext::~SessionGwThdContext()
       " native_write_bytes=%" PRIu64 " transaction_conflicts=%" PRIu64,
       statistics_.connection_attempts, statistics_.connection_retries,
       client.requests, client.request_bytes, client.response_bytes,
-      client.network_nanoseconds, statistics_.metadata_cache_hits,
+      client.network_nanoseconds, client.transport_read_calls,
+      client.transport_read_iterations, client.transport_read_bytes,
+      client.transport_read_nanoseconds,
+      client.websocket_header_read_calls, client.websocket_header_read_nanoseconds,
+      client.websocket_payload_read_calls, client.websocket_payload_read_nanoseconds,
+      client.frame_decode_nanoseconds, client.native_fetch_nanoseconds,
+      statistics_.metadata_cache_hits,
       statistics_.metadata_cache_misses, statistics_.cursors_opened,
       statistics_.cursors_closed, statistics_.operations_opened, statistics_.fetch_batches,
       statistics_.fetched_rows, statistics_.positioned_cache_hits,

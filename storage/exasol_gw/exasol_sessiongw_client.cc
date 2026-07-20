@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -116,6 +117,7 @@ public:
     close_noexcept();
     const sessiongw_c_options converted= c_options(options);
     check_sdk(sessiongw_c_connect(&converted, &session_));
+    instrumentation_enabled_= options.instrumentation_enabled;
   }
 
   void execute_sql(const SessionGwOptions &options, const std::string &sql)
@@ -189,7 +191,13 @@ public:
                                            std::uint32_t max_bytes)
   {
     sessiongw_c_native_fetch *fetch= nullptr;
+    const auto started= instrumentation_enabled_ ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     check_sdk(sessiongw_c_fetch_native(require_session(), cursor(cursor_id), max_rows, max_bytes, &fetch));
+    if (instrumentation_enabled_)
+      statistics_.native_fetch_nanoseconds += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started).count());
     return take_native_fetch(fetch);
   }
 
@@ -199,8 +207,14 @@ public:
   {
     const auto rows= row_numbers(row_handles);
     sessiongw_c_native_fetch *fetch= nullptr;
+    const auto started= instrumentation_enabled_ ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     check_sdk(sessiongw_c_fetch_positioned_native(require_session(), cursor(cursor_id),
                                                   rows.data(), rows.size(), max_bytes, &fetch));
+    if (instrumentation_enabled_)
+      statistics_.native_fetch_nanoseconds += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started).count());
     return take_native_fetch(fetch);
   }
 
@@ -350,6 +364,19 @@ private:
       statistics_.response_bytes= sdk.response_bytes;
       statistics_.network_nanoseconds= sdk.network_nanoseconds;
     }
+    sessiongw_c_transport_profile transport{};
+    if (sessiongw_c_transport_profile_get(session_, &transport) == 0)
+    {
+      statistics_.transport_read_calls= transport.read_calls;
+      statistics_.transport_read_iterations= transport.read_iterations;
+      statistics_.transport_read_bytes= transport.bytes_read;
+      statistics_.transport_read_nanoseconds= transport.read_nanoseconds;
+      statistics_.websocket_header_read_calls= transport.websocket_header_read_calls;
+      statistics_.websocket_header_read_nanoseconds= transport.websocket_header_read_nanoseconds;
+      statistics_.websocket_payload_read_calls= transport.websocket_payload_read_calls;
+      statistics_.websocket_payload_read_nanoseconds= transport.websocket_payload_read_nanoseconds;
+      statistics_.frame_decode_nanoseconds= transport.sessiongw_frame_decode_nanoseconds;
+    }
   }
 
   sessiongw_c_session *require_session() const
@@ -486,6 +513,7 @@ private:
   }
 
   sessiongw_c_session *session_= nullptr;
+  bool instrumentation_enabled_= false;
   std::unordered_map<std::uint64_t, sessiongw_c_cursor *> cursors_;
   std::unordered_map<std::uint64_t, sessiongw_c_operation *> operations_;
   SessionGwClientStatistics statistics_;

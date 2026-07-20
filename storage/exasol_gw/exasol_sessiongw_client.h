@@ -65,6 +65,16 @@ struct SessionGwClientStatistics
   std::uint64_t request_bytes= 0;
   std::uint64_t response_bytes= 0;
   std::uint64_t network_nanoseconds= 0;
+  std::uint64_t transport_read_calls= 0;
+  std::uint64_t transport_read_iterations= 0;
+  std::uint64_t transport_read_bytes= 0;
+  std::uint64_t transport_read_nanoseconds= 0;
+  std::uint64_t websocket_header_read_calls= 0;
+  std::uint64_t websocket_header_read_nanoseconds= 0;
+  std::uint64_t websocket_payload_read_calls= 0;
+  std::uint64_t websocket_payload_read_nanoseconds= 0;
+  std::uint64_t frame_decode_nanoseconds= 0;
+  std::uint64_t native_fetch_nanoseconds= 0;
   std::uint64_t insert_batches= 0;
   std::uint64_t insert_rows= 0;
   std::uint64_t update_batches= 0;
