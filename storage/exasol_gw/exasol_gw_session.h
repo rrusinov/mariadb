@@ -40,9 +40,13 @@ struct SessionGwAdapterStatistics
 class SessionGwThdContext
 {
 public:
+  explicit SessionGwThdContext(THD *thd): thd_(thd) {}
   ~SessionGwThdContext();
 
   SessionGwConnection &connection();
+  void participate_in_statement(bool explicit_transaction);
+  void commit_transaction(bool all);
+  void rollback_transaction(bool all);
   SessionGwDescribeTableResult describe_table(const std::string &schema,
                                                const std::string &table);
   void read_cursor_opened();
@@ -63,7 +67,10 @@ public:
 
 private:
   void finish_idle_read_transaction();
+  void synchronize_autocommit(bool enabled);
+  void finish_transaction_boundary();
 
+  THD *thd_;
   SessionGwOptions options_= options_from_environment();
   SessionGwConnection connection_;
   bool connected_= false;
@@ -71,6 +78,9 @@ private:
   std::size_t open_operations_= 0;
   std::size_t statement_tables_= 0;
   bool read_transaction_pending_= false;
+  bool remote_autocommit_known_= false;
+  bool remote_autocommit_= true;
+  bool transaction_active_= false;
   std::vector<SessionGwDescribeTableResult> metadata_cache_;
   SessionGwAdapterStatistics statistics_;
 };

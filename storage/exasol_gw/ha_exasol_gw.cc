@@ -157,7 +157,7 @@ public:
 
   ulonglong table_flags() const override
   {
-    return HA_BINLOG_STMT_CAPABLE | HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY | HA_NO_TRANSACTIONS;
+    return HA_BINLOG_STMT_CAPABLE | HA_REC_NOT_IN_SEQ | HA_NULL_IN_KEY;
   }
 
   ulong index_flags(uint, uint, bool) const override { return 0; }
@@ -1868,7 +1868,20 @@ int ha_exasol_gw::external_lock(THD *thd, int lock_type)
   {
     if (lock_type != F_UNLCK)
     {
-      exasol_gw::session_for_thd(thd).statement_table_opened();
+      const bool explicit_transaction=
+          thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+      // If the savepoint predates this engine's first access, MariaDB has no
+      // EXASOL savepoint slot to invoke. Reject participation before any
+      // remote read or mutation rather than provide partial rollback.
+      if (explicit_transaction && thd->transaction->savepoints)
+      {
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "accessing ENGINE=EXASOL after SAVEPOINT");
+        return HA_ERR_UNSUPPORTED;
+      }
+      exasol_gw::SessionGwThdContext &session= exasol_gw::session_for_thd(thd);
+      session.participate_in_statement(explicit_transaction);
+      session.statement_table_opened();
       return 0;
     }
 
@@ -2165,6 +2178,11 @@ static select_handler *create_exasol_gw_select_handler(THD *thd,
 {
   try
   {
+    // Pushed SQL keeps query-cache table references until transaction end and
+    // cannot safely upgrade the same table to a DMP write. Explicit
+    // transactions use the direct scan path so a read can precede DML.
+    if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+      return nullptr;
     if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
       return nullptr;
 
@@ -2192,6 +2210,8 @@ static select_handler *create_exasol_gw_unit_handler(THD *thd,
 {
   try
   {
+    if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+      return nullptr;
     if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
       return nullptr;
 
@@ -2222,6 +2242,8 @@ static derived_handler *create_exasol_gw_derived_handler(THD *thd,
     if (!derived || !derived->derived)
       return nullptr;
 
+    if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+      return nullptr;
     if (!is_supported_exasol_gw_pushdown(thd->lex->sql_command))
       return nullptr;
 
@@ -2244,6 +2266,63 @@ static derived_handler *create_exasol_gw_derived_handler(THD *thd,
   }
 }
 
+static exasol_gw::SessionGwThdContext *exasol_gw_thd_context(THD *thd)
+{
+  return static_cast<exasol_gw::SessionGwThdContext *>(
+      thd_get_ha_data(thd, exasol_gw_hton));
+}
+
+static int exasol_gw_commit(THD *thd, bool all)
+{
+  try
+  {
+    exasol_gw::SessionGwThdContext *context= exasol_gw_thd_context(thd);
+    if (context)
+      context->commit_transaction(all);
+    return 0;
+  }
+  catch (...)
+  {
+    return report_handler_exception("committing EXASOL transaction");
+  }
+}
+
+static int exasol_gw_rollback(THD *thd, bool all)
+{
+  try
+  {
+    exasol_gw::SessionGwThdContext *context= exasol_gw_thd_context(thd);
+    if (context)
+      context->rollback_transaction(all);
+    return 0;
+  }
+  catch (...)
+  {
+    return report_handler_exception("rolling back EXASOL transaction");
+  }
+}
+
+static int reject_exasol_gw_savepoint(const char *operation)
+{
+  my_error(ER_NOT_SUPPORTED_YET, MYF(0), operation);
+  return 1;
+}
+
+static int exasol_gw_savepoint_set(THD *, void *)
+{
+  return reject_exasol_gw_savepoint("SAVEPOINT with ENGINE=EXASOL");
+}
+
+static int exasol_gw_savepoint_rollback(THD *, void *)
+{
+  return reject_exasol_gw_savepoint("ROLLBACK TO SAVEPOINT with ENGINE=EXASOL");
+}
+
+static int exasol_gw_savepoint_release(THD *, void *)
+{
+  return reject_exasol_gw_savepoint("RELEASE SAVEPOINT with ENGINE=EXASOL");
+}
+
 static int exasol_gw_close_connection(THD *thd)
 {
   try
@@ -2263,6 +2342,11 @@ static int exasol_gw_init(void *p)
   exasol_gw_hton->db_type= DB_TYPE_AUTOASSIGN;
   exasol_gw_hton->create= exasol_gw_create_handler;
   exasol_gw_hton->close_connection= exasol_gw_close_connection;
+  exasol_gw_hton->commit= exasol_gw_commit;
+  exasol_gw_hton->rollback= exasol_gw_rollback;
+  exasol_gw_hton->savepoint_set= exasol_gw_savepoint_set;
+  exasol_gw_hton->savepoint_rollback= exasol_gw_savepoint_rollback;
+  exasol_gw_hton->savepoint_release= exasol_gw_savepoint_release;
   exasol_gw_hton->create_select= create_exasol_gw_select_handler;
   exasol_gw_hton->create_unit= create_exasol_gw_unit_handler;
   exasol_gw_hton->create_derived= create_exasol_gw_derived_handler;

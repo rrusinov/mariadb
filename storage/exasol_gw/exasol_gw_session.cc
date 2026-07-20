@@ -47,6 +47,18 @@ std::uint64_t connect_with_retry(SessionGwConnection &connection, const SessionG
 
 SessionGwThdContext::~SessionGwThdContext()
 {
+  if (connected_ && transaction_active_ && remote_autocommit_known_ && !remote_autocommit_)
+  {
+    try
+    {
+      connection_.rollback();
+    }
+    catch (...)
+    {
+      // Session teardown still closes the transport; the server rolls back
+      // every uncommitted transaction during session cleanup.
+    }
+  }
   if (!options_.instrumentation_enabled)
     return;
   const SessionGwClientStatistics &client= connection_.statistics();
@@ -106,8 +118,78 @@ SessionGwConnection &SessionGwThdContext::connection()
       statistics_.connection_retries += attempts - 1U;
     }
     connected_= true;
+    remote_autocommit_known_= false;
   }
   return connection_;
+}
+
+void SessionGwThdContext::synchronize_autocommit(const bool enabled)
+{
+  SessionGwConnection &session= connection();
+  if (remote_autocommit_known_ && remote_autocommit_ == enabled)
+    return;
+  session.set_autocommit(enabled);
+  remote_autocommit_= enabled;
+  remote_autocommit_known_= true;
+}
+
+void SessionGwThdContext::participate_in_statement(const bool explicit_transaction)
+{
+  trans_register_ha(thd_, false, exasol_gw_hton, 0);
+  if (explicit_transaction)
+    trans_register_ha(thd_, true, exasol_gw_hton, 0);
+  synchronize_autocommit(!explicit_transaction);
+  transaction_active_= true;
+}
+
+void SessionGwThdContext::finish_transaction_boundary()
+{
+  open_cursors_= 0;
+  open_operations_= 0;
+  statement_tables_= 0;
+  read_transaction_pending_= false;
+  transaction_active_= false;
+}
+
+void SessionGwThdContext::commit_transaction(const bool all)
+{
+  const bool explicit_transaction= remote_autocommit_known_ && !remote_autocommit_;
+  if (!connected_ || !transaction_active_ || (!all && explicit_transaction))
+    return;
+  // MariaDB invokes the autocommit statement callback before releasing table
+  // locks. DML contexts and read cursors close during that later unlock; let
+  // CloseOperation/finish_idle_read_transaction own the remote boundary.
+  if (!all && (open_operations_ != 0 || open_cursors_ != 0 || statement_tables_ != 0))
+    return;
+  try
+  {
+    connection_.commit();
+    finish_transaction_boundary();
+  }
+  catch (...)
+  {
+    reset();
+    throw;
+  }
+}
+
+void SessionGwThdContext::rollback_transaction(const bool all)
+{
+  const bool explicit_transaction= remote_autocommit_known_ && !remote_autocommit_;
+  if (!connected_ || !transaction_active_)
+    return;
+  if (!all && explicit_transaction)
+    thd_->mark_transaction_to_rollback(true);
+  try
+  {
+    connection_.rollback();
+    finish_transaction_boundary();
+  }
+  catch (...)
+  {
+    reset();
+    throw;
+  }
 }
 
 SessionGwDescribeTableResult SessionGwThdContext::describe_table(
@@ -136,6 +218,7 @@ SessionGwDescribeTableResult SessionGwThdContext::describe_table(
 void SessionGwThdContext::read_cursor_opened()
 {
   ++open_cursors_;
+  transaction_active_= true;
   if (options_.instrumentation_enabled)
     ++statistics_.cursors_opened;
   read_transaction_pending_= true;
@@ -155,6 +238,7 @@ void SessionGwThdContext::read_cursor_closed()
 void SessionGwThdContext::operation_opened()
 {
   ++open_operations_;
+  transaction_active_= true;
   if (options_.instrumentation_enabled)
     ++statistics_.operations_opened;
 }
@@ -164,7 +248,11 @@ void SessionGwThdContext::operation_closed()
   if (open_operations_ > 0)
     --open_operations_;
   if (open_operations_ == 0)
+  {
     read_transaction_pending_= false;
+    if (remote_autocommit_known_ && remote_autocommit_)
+      transaction_active_= false;
+  }
 }
 
 void SessionGwThdContext::statement_table_opened()
@@ -236,10 +324,11 @@ bool SessionGwThdContext::instrumentation_enabled() const noexcept
 void SessionGwThdContext::finish_idle_read_transaction()
 {
   if (connected_ && read_transaction_pending_ && open_cursors_ == 0 && open_operations_ == 0 &&
-      statement_tables_ == 0)
+      statement_tables_ == 0 && remote_autocommit_known_ && remote_autocommit_)
   {
     connection_.commit();
     read_transaction_pending_= false;
+    transaction_active_= false;
   }
 }
 
@@ -247,11 +336,16 @@ void SessionGwThdContext::reset() noexcept
 {
   // Invalidate local ownership before best-effort transport cleanup. A broken
   // connection must not leave this THD looking connected or trigger replay.
+  const bool explicit_transaction= remote_autocommit_known_ && !remote_autocommit_;
+  if (explicit_transaction && transaction_active_ && thd_)
+    thd_->mark_transaction_to_rollback(true);
   connected_= false;
   open_cursors_= 0;
   open_operations_= 0;
   statement_tables_= 0;
   read_transaction_pending_= false;
+  remote_autocommit_known_= false;
+  transaction_active_= false;
   metadata_cache_.clear();
   try
   {
@@ -269,7 +363,7 @@ SessionGwThdContext &session_for_thd(THD *thd)
   auto *context= static_cast<SessionGwThdContext *>(thd_get_ha_data(thd, exasol_gw_hton));
   if (!context)
   {
-    context= new SessionGwThdContext();
+    context= new SessionGwThdContext(thd);
     thd_set_ha_data(thd, exasol_gw_hton, context);
   }
   return *context;

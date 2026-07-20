@@ -369,7 +369,13 @@ log "PASS mariadb ready"
 
 ENGINES=$(mysql --batch --raw -e 'SHOW ENGINES')
 echo "$ENGINES" | grep -Eq '^EXASOL[[:space:]]+YES'
-log "PASS show engines"
+EXASOL_TRANSACTIONS=$(mysql --batch --raw --skip-column-names -e \
+    "SELECT TRANSACTIONS FROM INFORMATION_SCHEMA.ENGINES WHERE ENGINE='EXASOL'")
+if [[ "$EXASOL_TRANSACTIONS" != "YES" ]]; then
+    echo "EXASOL must advertise full commit/rollback support, got: $EXASOL_TRANSACTIONS" >&2
+    exit 1
+fi
+log "PASS show engines and transaction capability = $EXASOL_TRANSACTIONS"
 
 mysql --table <<SQL | tee -a "$REPORT"
 DROP DATABASE IF EXISTS $SCHEMA;
@@ -530,11 +536,9 @@ if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
         7
 fi
 
-# EXASOL is declared HA_NO_TRANSACTIONS, so MariaDB cannot expose a stale row
-# handle directly or roll back an already closed remote operation.  The closest
-# adapter-visible boundary check is positioned DML after ROLLBACK and after a
-# real COMMIT: it must address its new row, while rollback leaves the preceding
-# non-transactional remote DML.
+# One MariaDB THD maps to one SessionGateway transaction stream. Positioned
+# DML after ROLLBACK and COMMIT must obtain fresh transaction-scoped handles,
+# while explicit rollback must undo the completed remote operation.
 mysql --table <<SQL | tee -a "$REPORT"
 USE $SCHEMA;
 CREATE TABLE TXN_POS_T(ID INT, NAME VARCHAR(40)) ENGINE=EXASOL;
@@ -552,13 +556,64 @@ COMMIT;
 DELETE p FROM TXN_POS_T AS p JOIN TXN_POS_KEYS AS k ON p.ID=k.ID WHERE k.ID=4;
 SQL
 TXN_POS_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA; SELECT COUNT(*) FROM TXN_POS_T; SELECT SUM(ID) FROM TXN_POS_T; SELECT COUNT(*) FROM TXN_POS_T WHERE ID=1 AND NAME='before-rollback'; SELECT COUNT(*) FROM TXN_POS_T WHERE ID=2 AND NAME='after-rollback'; SELECT COUNT(*) FROM TXN_POS_T WHERE ID IN (3, 4);" | paste -sd'|' -)
-if [[ "$TXN_POS_FINAL" != "4|14|1|1|0" ]]; then
+if [[ "$TXN_POS_FINAL" != "4|14|0|1|0" ]]; then
     echo "Unexpected positioned transaction-boundary state: $TXN_POS_FINAL" >&2
     exit 1
 fi
 TXN_POS_REMOTE=$(sql_exasol "select count(*), sum(id) from $SCHEMA.TXN_POS_T")
 echo "$TXN_POS_REMOTE" | tee -a "$REPORT" | grep -Eq '"data":\[\[4\],\["?14"?\]\]'
 log "PASS positioned transaction boundary cleanup = $TXN_POS_FINAL"
+
+# SET autocommit and START TRANSACTION both synchronize remote autocommit. A
+# read can start the implicit transaction; subsequent DML is visible in that
+# transaction and is removed by rollback. The next transaction can commit on
+# the same THD/session.
+AUTOCOMMIT_SYNC_FINAL=$(mysql --batch --raw --skip-column-names -e "USE $SCHEMA;
+  SET autocommit=0;
+  SELECT COUNT(*) FROM TXN_POS_T;
+  INSERT INTO TXN_POS_T VALUES (7, 'rollback-after-read');
+  SELECT COUNT(*) FROM TXN_POS_T WHERE ID=7;
+  ROLLBACK;
+  INSERT INTO TXN_POS_T VALUES (8, 'commit-after-rollback');
+  COMMIT;
+  SET autocommit=1;
+  SELECT CONCAT((SELECT COUNT(*) FROM TXN_POS_T WHERE ID=7), '|',
+                (SELECT COUNT(*) FROM TXN_POS_T WHERE ID=8));" | paste -sd'|' -)
+if [[ "$AUTOCOMMIT_SYNC_FINAL" != "4|1|0|1" ]]; then
+    echo "Unexpected synchronized autocommit state: $AUTOCOMMIT_SYNC_FINAL" >&2
+    exit 1
+fi
+log "PASS read-started rollback and synchronized autocommit = $AUTOCOMMIT_SYNC_FINAL"
+
+expect_failure_contains "unsupported EXASOL savepoint" \
+    "USE $SCHEMA; START TRANSACTION; SELECT COUNT(*) FROM TXN_POS_T; SAVEPOINT exasol_sp" \
+    "SAVEPOINT with ENGINE=EXASOL"
+expect_failure_contains "EXASOL access after savepoint" \
+    "USE $SCHEMA; START TRANSACTION; SAVEPOINT before_exasol; SELECT COUNT(*) FROM TXN_POS_T" \
+    "accessing ENGINE=EXASOL after SAVEPOINT"
+log "PASS EXASOL user savepoints fail closed"
+
+# Without remote statement savepoints, any statement error in an explicit
+# transaction rolls back all preceding EXASOL work and marks the MariaDB
+# transaction rollback-only. A later COMMIT must not preserve a prefix.
+mysql -e "USE $SCHEMA; CREATE TABLE TXN_FAIL_T(ID INT NOT NULL) ENGINE=EXASOL; INSERT INTO TXN_FAIL_T VALUES (1)"
+if mysql --force -e "USE $SCHEMA; SET autocommit=0; INSERT INTO TXN_FAIL_T VALUES (2); INSERT INTO TXN_FAIL_T VALUES (NULL); COMMIT" \
+    >"$BASE_DIR/txn-failure.out" 2>"$BASE_DIR/txn-failure.err"; then
+    echo "Explicit transaction with failing EXASOL statement unexpectedly succeeded" >&2
+    exit 1
+fi
+TXN_FAIL_FINAL=$(mysql --batch --raw --skip-column-names -e \
+    "USE $SCHEMA; SELECT COUNT(*), SUM(ID) FROM TXN_FAIL_T")
+if [[ "$TXN_FAIL_FINAL" != $'1\t1' ]]; then
+    echo "Failed EXASOL transaction preserved a committed prefix: $TXN_FAIL_FINAL" >&2
+    exit 1
+fi
+log "PASS failed explicit transaction rolled back all EXASOL work"
+
+# THD/session teardown must never commit explicit work.
+mysql -e "USE $SCHEMA; SET autocommit=0; INSERT INTO TXN_FAIL_T VALUES (9)"
+expect_scalar "disconnect rolls back active EXASOL transaction" \
+    "USE $SCHEMA; SELECT COUNT(*) FROM TXN_FAIL_T WHERE ID=9" "0"
 
 if [[ "$POSITIONED_DML_TEST_ONLY" == "1" ]]; then
     mysql -e "DROP DATABASE $SCHEMA" >/dev/null
