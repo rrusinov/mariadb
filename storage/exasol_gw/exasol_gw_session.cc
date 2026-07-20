@@ -73,7 +73,8 @@ SessionGwThdContext::~SessionGwThdContext()
       " websocket_payload_calls=%" PRIu64 " websocket_payload_ns=%" PRIu64
       " frame_decode_ns=%" PRIu64 " native_fetch_ns=%" PRIu64
       " metadata_hits=%" PRIu64
-      " metadata_misses=%" PRIu64 " cursors_opened=%" PRIu64
+      " metadata_misses=%" PRIu64 " metadata_refreshes=%" PRIu64
+      " cursors_opened=%" PRIu64
       " cursors_closed=%" PRIu64 " operations=%" PRIu64 " fetch_batches=%" PRIu64
       " fetched_rows=%" PRIu64 " positioned_cache_hits=%" PRIu64
       " positioned_fetches=%" PRIu64 " positioned_rows=%" PRIu64 " arrow_bytes=%" PRIu64
@@ -93,7 +94,8 @@ SessionGwThdContext::~SessionGwThdContext()
       client.websocket_payload_read_calls, client.websocket_payload_read_nanoseconds,
       client.frame_decode_nanoseconds, client.native_fetch_nanoseconds,
       statistics_.metadata_cache_hits,
-      statistics_.metadata_cache_misses, statistics_.cursors_opened,
+      statistics_.metadata_cache_misses, statistics_.metadata_refreshes,
+      statistics_.cursors_opened,
       statistics_.cursors_closed, statistics_.operations_opened, statistics_.fetch_batches,
       statistics_.fetched_rows, statistics_.positioned_cache_hits,
       statistics_.positioned_fetches, statistics_.positioned_rows, statistics_.arrow_bytes,
@@ -148,6 +150,7 @@ void SessionGwThdContext::finish_transaction_boundary()
   open_operations_= 0;
   statement_tables_= 0;
   read_transaction_pending_= false;
+  metadata_cache_.clear();
   transaction_active_= false;
 }
 
@@ -195,23 +198,31 @@ void SessionGwThdContext::rollback_transaction(const bool all)
 SessionGwDescribeTableResult SessionGwThdContext::describe_table(
     const std::string &schema, const std::string &table)
 {
+  constexpr auto statistics_freshness= std::chrono::seconds(5);
   SessionGwConnection &session= connection();
-  for (SessionGwDescribeTableResult &cached: metadata_cache_)
+  const auto now= std::chrono::steady_clock::now();
+  for (CachedMetadata &cached: metadata_cache_)
   {
-    if (cached.schema_name != schema || cached.table_name != table)
+    if (cached.value.schema_name != schema || cached.value.table_name != table)
       continue;
     if (options_.instrumentation_enabled)
       ++statistics_.metadata_cache_hits;
     const std::string current_version= session.get_table_version(schema, table);
-    if (current_version != cached.table_version)
-      cached= session.describe_table(schema, table);
-    return cached;
+    const bool statistics_expired= now - cached.statistics_refreshed >= statistics_freshness;
+    if (current_version != cached.value.table_version || statistics_expired)
+    {
+      cached.value= session.describe_table(schema, table);
+      cached.statistics_refreshed= now;
+      if (options_.instrumentation_enabled)
+        ++statistics_.metadata_refreshes;
+    }
+    return cached.value;
   }
 
   if (options_.instrumentation_enabled)
     ++statistics_.metadata_cache_misses;
   SessionGwDescribeTableResult described= session.describe_table(schema, table);
-  metadata_cache_.push_back(described);
+  metadata_cache_.push_back(CachedMetadata{described, now});
   return described;
 }
 
@@ -250,6 +261,9 @@ void SessionGwThdContext::operation_closed()
   if (open_operations_ == 0)
   {
     read_transaction_pending_= false;
+    // Row-count statistics change independently of the schema generation.
+    // Refresh metadata after every local mutation boundary.
+    metadata_cache_.clear();
     if (remote_autocommit_known_ && remote_autocommit_)
       transaction_active_= false;
   }

@@ -44,6 +44,7 @@ struct UpdateContext;
 struct DeleteContext;
 exasol_gw::SessionGwRowHandle row_handle_from_ref(const uchar *ref);
 std::string table_schema_name(TABLE *table);
+std::string table_object_name(TABLE *table);
 std::string quote_exasol_identifier(const std::string &identifier);
 bool build_create_table_sql(TABLE *form, HA_CREATE_INFO *create_info,
                             std::string *sql, std::string *error);
@@ -407,10 +408,25 @@ public:
     std::memcpy(ref, &row_handle.row_number, sizeof(row_handle.row_number));
   }
 
-  int info(uint) override
+  int info(uint flag) override
   {
-    stats.records= 1000;
-    return 0;
+    if ((flag & HA_STATUS_VARIABLE) == 0)
+      return 0;
+    try
+    {
+      const exasol_gw::SessionGwDescribeTableResult described=
+          exasol_gw::session_for_thd(table->in_use).describe_table(
+              table_schema_name(table), table_object_name(table));
+      // Exasol omits the value when no current global-row statistic exists.
+      // Retain a conservative fallback instead of presenting unknown as empty.
+      stats.records= described.row_count_known ? described.row_count : 1000;
+      stats.deleted= 0;
+      return 0;
+    }
+    catch (...)
+    {
+      return report_handler_exception("reading EXASOL table statistics");
+    }
   }
 
   int external_lock(THD *, int lock_type) override;

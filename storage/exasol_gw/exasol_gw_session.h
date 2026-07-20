@@ -3,6 +3,7 @@
 
 #include "exasol_sessiongw_client.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -19,6 +20,7 @@ struct SessionGwAdapterStatistics
   std::uint64_t connection_retries= 0;
   std::uint64_t metadata_cache_hits= 0;
   std::uint64_t metadata_cache_misses= 0;
+  std::uint64_t metadata_refreshes= 0;
   std::uint64_t cursors_opened= 0;
   std::uint64_t cursors_closed= 0;
   std::uint64_t operations_opened= 0;
@@ -66,6 +68,12 @@ public:
   void reset() noexcept;
 
 private:
+  struct CachedMetadata
+  {
+    SessionGwDescribeTableResult value;
+    std::chrono::steady_clock::time_point statistics_refreshed;
+  };
+
   void finish_idle_read_transaction();
   void synchronize_autocommit(bool enabled);
   void finish_transaction_boundary();
@@ -81,7 +89,7 @@ private:
   bool remote_autocommit_known_= false;
   bool remote_autocommit_= true;
   bool transaction_active_= false;
-  std::vector<SessionGwDescribeTableResult> metadata_cache_;
+  std::vector<CachedMetadata> metadata_cache_;
   SessionGwAdapterStatistics statistics_;
 };
 

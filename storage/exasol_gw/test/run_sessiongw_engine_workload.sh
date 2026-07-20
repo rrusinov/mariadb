@@ -92,7 +92,7 @@ log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
 sql_exasol() {
     (cd "$DB_EXANANO" && c4 sqlclient --usetls --skiptlsverify --user sys --password exasol \
-        --connection localhost:$EXASOL_PORT --query "$1")
+        --connection 127.0.0.1:$EXASOL_PORT --query "$1")
 }
 
 mysql() {
@@ -389,6 +389,33 @@ DELETE FROM T WHERE ID=3;
 SELECT * FROM T ORDER BY ID;
 SELECT COUNT(*) AS C, SUM(ID) AS S, MAX(NAME) AS M FROM T;
 SQL
+PLANNER_ROWS=$(mysql --batch --raw --skip-column-names -e "
+  SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$SCHEMA' AND TABLE_NAME='T';
+  USE $SCHEMA; INSERT INTO T VALUES (5, 'Stats');
+  SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$SCHEMA' AND TABLE_NAME='T';
+  DELETE FROM T WHERE ID=5;
+  SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$SCHEMA' AND TABLE_NAME='T';" | paste -sd'|' -)
+if [[ "$PLANNER_ROWS" != "3|4|3" ]]; then
+    echo "Unexpected cached planner row statistics: $PLANNER_ROWS" >&2
+    exit 1
+fi
+log "PASS remote planner row statistics and local DML invalidation = $PLANNER_ROWS"
+
+mysql -e "USE $SCHEMA; CREATE TABLE STATS_REFRESH_T(ID INT) ENGINE=EXASOL; INSERT INTO STATS_REFRESH_T VALUES (1)"
+STATS_REFRESH_ROWS=$(mysql --batch --raw --skip-column-names -e "
+  SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$SCHEMA' AND TABLE_NAME='STATS_REFRESH_T';
+  DO SLEEP(6);
+  SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$SCHEMA' AND TABLE_NAME='STATS_REFRESH_T';" | paste -sd'|' -)
+if [[ "$STATS_REFRESH_ROWS" != "1|1" ]]; then
+    echo "Unexpected refreshed planner statistics: $STATS_REFRESH_ROWS" >&2
+    exit 1
+fi
+STATS_REFRESH_METRICS=$(grep 'SessionGW performance:' "$MDB/mariadb.err" | tail -1)
+if [[ ! "$STATS_REFRESH_METRICS" =~ metadata_hits=[1-9][0-9]*\ metadata_misses=1\ metadata_refreshes=1 ]]; then
+    echo "Planner metadata freshness was not instrumented as one cache refresh: $STATS_REFRESH_METRICS" >&2
+    exit 1
+fi
+log "PASS planner statistics five-second freshness and cache instrumentation = $STATS_REFRESH_ROWS"
 log "PASS ddl insert update delete scan"
 
 mysql -e "USE $SCHEMA; CREATE TABLE META_GUARD(ID INT, NAME VARCHAR(20)) ENGINE=EXASOL; INSERT INTO META_GUARD VALUES (1, 'bound'); SELECT * FROM META_GUARD" >/dev/null

@@ -149,6 +149,8 @@ struct SessionGwDescribeTableResult
   std::string table_name;
   std::string table_version;
   std::vector<std::uint8_t> arrow_schema;
+  bool row_count_known= false;
+  std::uint64_t row_count= 0;
 };
 
 struct SessionGwOpenOperationResult

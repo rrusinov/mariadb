@@ -145,6 +145,8 @@ public:
     result.schema_name= sessiongw_c_metadata_schema_name(metadata);
     result.table_name= sessiongw_c_metadata_table_name(metadata);
     result.table_version= sessiongw_c_metadata_version(metadata);
+    result.row_count_known= sessiongw_c_metadata_has_row_count(metadata) != 0;
+    result.row_count= sessiongw_c_metadata_row_count(metadata);
     std::size_t size= 0;
     const std::uint8_t *schema_bytes= sessiongw_c_metadata_schema_ipc(metadata, &size);
     result.arrow_schema= copy_bytes(schema_bytes, size);
